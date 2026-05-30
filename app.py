@@ -35,19 +35,35 @@ WEEKDAY_ABBREVIATIONS = {
     6: "SU",
 }
 
+DEFAULT_LEVEL_ABBREVIATIONS = {
+    "OPEN": "O",
+    "PREMIER": "P",
+    "CLUB": "C",
+    "CLASSIC": "C",
+    "ELITE": "E",
+    "POWER": "P",
+    "P": "P",
+    "GOLD": "G",
+    "SILVER": "S",
+    "BRONZE": "B",
+    "PLATINUM": "P",
+    "DIAMOND": "D",
+    "RUBY": "R",
+    "SAPPHIRE": "S",
+    "EMERALD": "E",
+    "SELECT": "S",
+    "NATIONAL": "N",
+    "AMERICAN": "A",
+    "REGIONAL": "R",
+    "USA": "U",
+}
+
 
 # =========================
 # INPUT HELPERS
 # =========================
 
 def extract_event_key(user_input: str) -> str:
-    """
-    Accepts either:
-    - PTAwMDAwNDEzMjQ90
-    - https://results.advancedeventsystems.com/event/PTAwMDAwNDEzMjQ90/home
-    - https://results.advancedeventsystems.com/event/PTAwMDAwNDEzMjQ90/court-schedule
-    - https://results.advancedeventsystems.com/api/event/PTAwMDAwNDEzMjQ90
-    """
     text = (user_input or "").strip()
 
     if not text:
@@ -78,8 +94,8 @@ def reset_app():
         "event_info",
         "event_key",
         "generated_workbooks",
-        "division_rows",
-        "division_editor",
+        "level_rows",
+        "level_editor",
     ]
 
     for key in keys_to_clear:
@@ -214,6 +230,12 @@ def normalize_power_text(text: str) -> str:
     return text
 
 
+def normalize_level_name(level_name: str) -> str:
+    level_name = normalize_power_text((level_name or "").strip())
+    level_name = re.sub(r"\s+", " ", level_name)
+    return level_name
+
+
 def normalize_hex_color(hex_color: str | None) -> str:
     if not hex_color:
         return "FFFFFFFF"
@@ -244,62 +266,133 @@ def display_hex_color(hex_color: str | None) -> str:
     return "#FFFFFF"
 
 
-def division_level_name(division_name: str) -> str:
-    """
-    Groups divisions by name regardless of age.
-
-    Examples:
-    11 Classic -> Classic
-    12 Classic -> Classic
-    13 Open -> Open
-    18 Power -> P
-    """
-    name = normalize_power_text((division_name or "").strip())
-    name = re.sub(r"^\d{1,2}\s*", "", name).strip()
-
-    return name or "Division"
-
-
 def division_age(division_name: str) -> str:
     match = re.search(r"^\s*(\d{1,2})", division_name or "")
     return match.group(1) if match else ""
 
 
-def abbreviation_suffix(abbreviation: str, age: str) -> str:
-    abbreviation = normalize_power_text((abbreviation or "").strip())
+def division_level_name(division_name: str) -> str:
+    name = normalize_power_text((division_name or "").strip())
+    name = re.sub(r"^\d{1,2}\s*", "", name).strip()
+    name = normalize_level_name(name)
 
-    if age and abbreviation.startswith(age):
-        return abbreviation[len(age):]
-
-    return abbreviation
-
-
-def auto_division_abbreviation(division_name: str, code_alias: str = "") -> str:
-    division_name = normalize_power_text((division_name or "").strip())
-    code_alias = normalize_power_text((code_alias or "").strip())
-
-    if re.fullmatch(r"\d{1,2}[A-Z]+", code_alias):
-        return code_alias
-
-    match = re.search(r"(\d{1,2})\s*([A-Za-z]+)", division_name)
-
-    if not match:
-        return code_alias or ""
-
-    age = match.group(1)
-    level_word = match.group(2).strip()
-
-    if level_word.lower() == "power":
-        level_letter = "P"
-    else:
-        level_letter = level_word[0].upper()
-
-    return f"{age}{level_letter}"
+    return name or "Division"
 
 
-def remove_round_from_match_short_name(short_name: str) -> str:
-    short_name = normalize_power_text((short_name or "").strip())
-    return re.sub(r"^R\d+", "", short_name)
+def default_level_abbreviation(level_name: str) -> str:
+    level = normalize_level_name(level_name)
+
+    if not level:
+        return ""
+
+    lookup_key = level.upper()
+
+    if lookup_key in DEFAULT_LEVEL_ABBREVIATIONS:
+        return DEFAULT_LEVEL_ABBREVIATIONS[lookup_key]
+
+    first_word = re.split(r"\s+", level.strip())[0]
+
+    if not first_word:
+        return ""
+
+    return first_word[0].upper()
+
+
+def clean_match_name(raw_name: str) -> str:
+    """
+    Final match-name cleaner.
+
+    Rules:
+    - Remove R1, R2, R3, R4, R5, etc. anywhere in the match name.
+    - Delete all lowercase letters.
+    - Delete all symbols/spaces/punctuation.
+    - Keep only numbers and capital letters.
+
+    Examples:
+    14CR1AM1 -> 14CAM1
+    14Cr1aM1 -> 14CM1
+    15PowerR2BM3 -> 15PBM3
+    """
+    if not raw_name:
+        return ""
+
+    text = normalize_power_text(str(raw_name))
+
+    # Remove round labels like R1, R2, R10 anywhere in the name.
+    text = re.sub(r"R\d+", "", text)
+
+    # Keep only numeric and capital characters.
+    text = re.sub(r"[^A-Z0-9]", "", text)
+
+    return text
+
+
+def build_level_rows(divisions: list[dict]) -> list[dict]:
+    level_map = {}
+
+    for division in divisions:
+        division_name = division.get("Name", "")
+        level = division_level_name(division_name)
+
+        if level not in level_map:
+            level_map[level] = {
+                "Division Level": level,
+                "Abbreviation": default_level_abbreviation(level),
+                "Divisions Using This Level": [],
+            }
+
+        level_map[level]["Divisions Using This Level"].append(division_name)
+
+    rows = []
+
+    for level in sorted(level_map.keys()):
+        row = level_map[level]
+        row["Divisions Using This Level"] = ", ".join(row["Divisions Using This Level"])
+        rows.append(row)
+
+    return rows
+
+
+def resolve_level_abbreviations(edited_level_rows: list[dict]) -> dict:
+    level_abbreviations = {}
+
+    for row in edited_level_rows:
+        level = normalize_level_name(str(row.get("Division Level", "")).strip())
+        abbreviation = normalize_power_text(str(row.get("Abbreviation", "")).strip())
+
+        if not abbreviation:
+            abbreviation = default_level_abbreviation(level)
+
+        # Abbreviations should only use capital letters/numbers.
+        abbreviation = re.sub(r"[^A-Z0-9]", "", abbreviation)
+
+        level_abbreviations[level] = abbreviation
+
+    return level_abbreviations
+
+
+def build_division_settings_from_levels(divisions: list[dict], level_abbreviations: dict) -> dict:
+    division_settings = {}
+
+    for division in divisions:
+        division_id = division.get("DivisionId")
+        division_name = division.get("Name", "")
+        age = division_age(division_name)
+        level = division_level_name(division_name)
+
+        level_abbreviation = level_abbreviations.get(
+            level,
+            default_level_abbreviation(level),
+        )
+
+        final_abbreviation = f"{age}{level_abbreviation}" if age else level_abbreviation
+
+        division_settings[division_id] = {
+            "abbreviation": clean_match_name(final_abbreviation),
+            "color": display_hex_color(division.get("ColorHex")),
+        }
+
+    return division_settings
 
 
 def get_division_correction(match: dict, division_settings: dict) -> dict:
@@ -309,126 +402,34 @@ def get_division_correction(match: dict, division_settings: dict) -> dict:
     if division_id in division_settings:
         return division_settings[division_id]
 
+    division_name = division.get("Name", "")
+    age = division_age(division_name)
+    level = division_level_name(division_name)
+    level_abbreviation = default_level_abbreviation(level)
+    final_abbreviation = f"{age}{level_abbreviation}" if age else level_abbreviation
+
     return {
-        "abbreviation": auto_division_abbreviation(
-            division.get("Name", ""),
-            division.get("CodeAlias", ""),
-        ),
+        "abbreviation": clean_match_name(final_abbreviation),
         "color": display_hex_color(division.get("ColorHex")),
     }
 
 
 def build_assignment_match_display_name(match: dict, division_settings: dict) -> str:
     correction = get_division_correction(match, division_settings)
-    division_code = normalize_power_text(correction["abbreviation"])
+    division_code = correction["abbreviation"]
 
     short_name = match.get("CompleteShortName") or ""
-    short_name = remove_round_from_match_short_name(short_name)
 
-    return normalize_power_text(f"{division_code}{short_name}")
+    return clean_match_name(f"{division_code}{short_name}")
 
 
 def build_worksheet_match_display_name(match: dict, division_settings: dict) -> str:
     correction = get_division_correction(match, division_settings)
-    division_code = normalize_power_text(correction["abbreviation"])
+    division_code = correction["abbreviation"]
 
-    short_name = normalize_power_text((match.get("CompleteShortName") or "").strip())
+    short_name = match.get("CompleteShortName") or ""
 
-    return normalize_power_text(f"{division_code}{short_name}")
-
-
-def build_division_rows(divisions: list[dict]) -> list[dict]:
-    rows = []
-
-    for division in divisions:
-        name = division.get("Name", "")
-        age = division_age(name)
-        level = division_level_name(name)
-        auto_abbrev = auto_division_abbreviation(name, division.get("CodeAlias", ""))
-
-        rows.append(
-            {
-                "DivisionId": division.get("DivisionId"),
-                "Division Name": name,
-                "Level Group": level,
-                "Team Count": division.get("TeamCount", ""),
-                "AES Code": division.get("CodeAlias", ""),
-                "Final Abbreviation": auto_abbrev,
-                "_Original Abbreviation": auto_abbrev,
-                "_Age": age,
-                "_Color": display_hex_color(division.get("ColorHex")),
-            }
-        )
-
-    return rows
-
-
-def resolve_division_settings(edited_rows: list[dict], original_rows: list[dict]) -> dict:
-    """
-    If one abbreviation changes for a level group, apply that same suffix
-    to every division with that level group while keeping each age.
-
-    Example:
-    11 Classic changed from 11C to 11CL
-    12 Classic becomes 12CL
-    13 Classic becomes 13CL
-
-    Colors are not displayed or edited in the app. They stay from AES.
-    """
-    original_by_name = {
-        row["Division Name"]: row
-        for row in original_rows
-    }
-
-    edited_by_name = {
-        row["Division Name"]: row
-        for row in edited_rows
-    }
-
-    changed_suffix_by_level = {}
-
-    for original in original_rows:
-        division_name = original["Division Name"]
-        edited = edited_by_name.get(division_name, original)
-
-        level = original["Level Group"]
-        age = original["_Age"]
-
-        original_abbrev = normalize_power_text(str(original["_Original Abbreviation"]).strip())
-        edited_abbrev = normalize_power_text(str(edited.get("Final Abbreviation", original_abbrev)).strip())
-
-        original_suffix = abbreviation_suffix(original_abbrev, age)
-        edited_suffix = abbreviation_suffix(edited_abbrev, age)
-
-        if edited_suffix and edited_suffix != original_suffix:
-            changed_suffix_by_level[level] = edited_suffix
-
-    division_settings = {}
-
-    for original in original_rows:
-        division_id = original["DivisionId"]
-        division_name = original["Division Name"]
-        edited = edited_by_name.get(division_name, original)
-
-        level = original["Level Group"]
-        age = original["_Age"]
-
-        edited_abbrev = normalize_power_text(
-            str(edited.get("Final Abbreviation", original["_Original Abbreviation"])).strip()
-        )
-
-        if level in changed_suffix_by_level:
-            suffix = changed_suffix_by_level[level]
-            final_abbrev = f"{age}{suffix}" if age else suffix
-        else:
-            final_abbrev = edited_abbrev
-
-        division_settings[division_id] = {
-            "abbreviation": normalize_power_text(final_abbrev),
-            "color": original["_Color"],
-        }
-
-    return division_settings
+    return clean_match_name(f"{division_code}{short_name}")
 
 
 # =========================
@@ -482,6 +483,18 @@ def template_row_for_output_row(output_row: int) -> int:
         return 1
 
     return 2 + ((output_row - 2) % len(ROLE_ROWS))
+
+
+def clear_unused_match_cell_fills(ws, start_row: int, max_row: int, start_col: int, max_col: int):
+    if max_col < start_col:
+        return
+
+    for row in range(start_row, max_row + 1):
+        for col in range(start_col, max_col + 1):
+            cell = ws.cell(row=row, column=col)
+
+            if cell.value is None or str(cell.value).strip() == "":
+                cell.fill = PatternFill(fill_type=None)
 
 
 def apply_template_columns_a_to_d(ws, template_ws, max_row: int):
@@ -745,17 +758,29 @@ def build_assignment_grid_sheet(
         match_cell = ws.cell(row=base_row, column=col)
         format_cell = ws.cell(row=base_row + 1, column=col)
 
-        match_cell.value = build_assignment_match_display_name(match, division_settings)
-        match_cell.font = Font(name="Calibri", size=11, bold=True)
-        match_cell.alignment = Alignment(horizontal="center", vertical="center")
+        match_name = build_assignment_match_display_name(match, division_settings)
 
-        correction = get_division_correction(match, division_settings)
-        fill_color = normalize_hex_color(correction["color"])
-        match_cell.fill = PatternFill(fill_type="solid", fgColor=fill_color)
+        if match_name:
+            match_cell.value = match_name
+            match_cell.font = Font(name="Calibri", size=11, bold=True)
+            match_cell.alignment = Alignment(horizontal="center", vertical="center")
 
-        format_cell.value = determine_match_format(match)
-        format_cell.font = Font(name="Calibri", size=11, bold=False)
-        format_cell.alignment = Alignment(horizontal="center", vertical="center")
+            correction = get_division_correction(match, division_settings)
+            fill_color = normalize_hex_color(correction["color"])
+            match_cell.fill = PatternFill(fill_type="solid", fgColor=fill_color)
+
+            format_cell.value = determine_match_format(match)
+            format_cell.font = Font(name="Calibri", size=11, bold=False)
+            format_cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    if court_names:
+        clear_unused_match_cell_fills(
+            ws=ws,
+            start_row=2,
+            max_row=max_row,
+            start_col=start_court_col,
+            max_col=end_court_col,
+        )
 
     ws["D1"].value = None
     ws["D1"].fill = PatternFill(fill_type=None)
@@ -833,13 +858,25 @@ def build_worksheet_grid_sheet(
         col = court_to_col[court_name]
         cell = ws.cell(row=row, column=col)
 
-        cell.value = build_worksheet_match_display_name(match, division_settings)
-        cell.font = Font(name="Calibri", size=11, bold=True)
-        cell.alignment = Alignment(horizontal="center", vertical="center")
+        match_name = build_worksheet_match_display_name(match, division_settings)
 
-        correction = get_division_correction(match, division_settings)
-        fill_color = normalize_hex_color(correction["color"])
-        cell.fill = PatternFill(fill_type="solid", fgColor=fill_color)
+        if match_name:
+            cell.value = match_name
+            cell.font = Font(name="Calibri", size=11, bold=True)
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+
+            correction = get_division_correction(match, division_settings)
+            fill_color = normalize_hex_color(correction["color"])
+            cell.fill = PatternFill(fill_type="solid", fgColor=fill_color)
+
+    if court_names:
+        clear_unused_match_cell_fills(
+            ws=ws,
+            start_row=2,
+            max_row=max_row,
+            start_col=start_court_col,
+            max_col=max_col,
+        )
 
     ws.column_dimensions["A"].width = 10
 
@@ -938,7 +975,7 @@ with top_right:
 
 st.write(
     "Paste an AES event key or full AES schedule URL, review the event information, "
-    "adjust division abbreviations if needed, then generate both Excel workbooks."
+    "set division level abbreviations, then generate both Excel workbooks."
 )
 
 if "event_info" not in st.session_state:
@@ -950,8 +987,8 @@ if "event_key" not in st.session_state:
 if "generated_workbooks" not in st.session_state:
     st.session_state.generated_workbooks = None
 
-if "division_rows" not in st.session_state:
-    st.session_state.division_rows = None
+if "level_rows" not in st.session_state:
+    st.session_state.level_rows = None
 
 
 event_input = st.text_input(
@@ -972,7 +1009,7 @@ if fetch_clicked:
                 st.session_state.event_info = get_event_info(clean_key)
                 st.session_state.event_key = clean_key
                 st.session_state.generated_workbooks = None
-                st.session_state.division_rows = build_division_rows(
+                st.session_state.level_rows = build_level_rows(
                     st.session_state.event_info.get("Divisions", [])
                 )
 
@@ -980,6 +1017,7 @@ if fetch_clicked:
         except Exception:
             st.session_state.event_info = None
             st.session_state.generated_workbooks = None
+            st.session_state.level_rows = None
             st.error("Could not load event.")
 
 
@@ -1002,61 +1040,51 @@ if event_info:
 
     st.caption(f"AES event key: `{st.session_state.event_key}`")
 
-    st.subheader("Division Abbreviations")
+    st.subheader("Division Level Abbreviations")
 
     st.write(
-        "Edit abbreviations if needed. If you change one abbreviation for a shared level group, "
-        "such as Classic, the same suffix will apply to all Classic divisions regardless of age."
+        "Set one abbreviation for each unique division level. "
+        "The app will add the age automatically. For example, Classic → C gives 11C, 12C, 13C."
     )
 
-    if st.session_state.division_rows is None:
-        st.session_state.division_rows = build_division_rows(event_info.get("Divisions", []))
+    if st.session_state.level_rows is None:
+        st.session_state.level_rows = build_level_rows(event_info.get("Divisions", []))
 
-    edited_rows = st.data_editor(
-        st.session_state.division_rows,
+    edited_level_rows = st.data_editor(
+        st.session_state.level_rows,
         use_container_width=True,
         num_rows="fixed",
         hide_index=True,
         column_order=[
-            "Division Name",
-            "Level Group",
-            "Team Count",
-            "AES Code",
-            "Final Abbreviation",
+            "Division Level",
+            "Abbreviation",
+            "Divisions Using This Level",
         ],
         column_config={
-            "Division Name": st.column_config.TextColumn(
-                "Division Name",
+            "Division Level": st.column_config.TextColumn(
+                "Division Level",
+                disabled=True,
+                width="medium",
+            ),
+            "Abbreviation": st.column_config.TextColumn(
+                "Abbreviation",
+                help="Example: Open → O, Gold → G, Silver → S, Bronze → B",
+                width="small",
+            ),
+            "Divisions Using This Level": st.column_config.TextColumn(
+                "Divisions Using This Level",
                 disabled=True,
                 width="large",
             ),
-            "Level Group": st.column_config.TextColumn(
-                "Level Group",
-                disabled=True,
-                width="medium",
-            ),
-            "Team Count": st.column_config.NumberColumn(
-                "Team Count",
-                disabled=True,
-                width="small",
-            ),
-            "AES Code": st.column_config.TextColumn(
-                "AES Code",
-                disabled=True,
-                width="small",
-            ),
-            "Final Abbreviation": st.column_config.TextColumn(
-                "Final Abbreviation",
-                help="Example: 18O, 17P, 14C. Changing Classic from 11C to 11CL will make 12CL, 13CL, etc.",
-                width="medium",
-            ),
         },
-        key="division_editor",
+        key="level_editor",
     )
 
-    division_settings = resolve_division_settings(
-        edited_rows=edited_rows,
-        original_rows=st.session_state.division_rows,
+    level_abbreviations = resolve_level_abbreviations(edited_level_rows)
+
+    division_settings = build_division_settings_from_levels(
+        divisions=event_info.get("Divisions", []),
+        level_abbreviations=level_abbreviations,
     )
 
     st.subheader("Generate Workbooks")
