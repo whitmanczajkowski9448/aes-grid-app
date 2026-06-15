@@ -1,6 +1,7 @@
 import re
+from collections import defaultdict
 from copy import copy
-from datetime import datetime, date, timedelta, timezone
+from datetime import datetime, date, time, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -38,9 +39,13 @@ WEEKDAY_ABBREVIATIONS = {
 DEFAULT_LEVEL_ABBREVIATIONS = {
     "OPEN": "O",
     "PREMIER": "P",
-    "CLUB": "C",
-    "CLASSIC": "C",
     "ELITE": "E",
+    "SELECT": "S",
+    "ASCEND": "A",
+    "CLUB": "C",
+    "ASPIRE": "AS",
+    "SPIRIT": "SP",
+    "CLASSIC": "CL",
     "POWER": "P",
     "P": "P",
     "GOLD": "G",
@@ -51,7 +56,6 @@ DEFAULT_LEVEL_ABBREVIATIONS = {
     "RUBY": "R",
     "SAPPHIRE": "S",
     "EMERALD": "E",
-    "SELECT": "S",
     "NATIONAL": "N",
     "AMERICAN": "A",
     "REGIONAL": "R",
@@ -889,6 +893,593 @@ def build_worksheet_grid_sheet(
     ws.freeze_panes = "B2"
 
 
+
+
+# =========================
+# GRID COMPARISON HELPERS
+# =========================
+
+def is_blank_cell_value(value) -> bool:
+    return value is None or str(value).strip() == ""
+
+
+def parse_grid_time_value(value) -> time | None:
+    """Parse a worksheet time cell only when it is truly a time value."""
+    if value is None:
+        return None
+
+    if isinstance(value, datetime):
+        return value.time().replace(second=0, microsecond=0)
+
+    if isinstance(value, time):
+        return value.replace(second=0, microsecond=0)
+
+    if isinstance(value, (int, float)):
+        # Excel stores times as fractional days. Ignore larger values because
+        # they are usually dates/counts in this type of workbook.
+        if 0 <= value < 1:
+            total_minutes = round(value * 24 * 60)
+            hour = (total_minutes // 60) % 24
+            minute = total_minutes % 60
+            return time(hour=hour, minute=minute)
+        return None
+
+    if isinstance(value, str):
+        text = value.strip()
+        match = re.fullmatch(r"(\d{1,2}):(\d{2})(?:\s*([AP]M))?", text, flags=re.IGNORECASE)
+
+        if not match:
+            return None
+
+        hour = int(match.group(1))
+        minute = int(match.group(2))
+        suffix = match.group(3).upper() if match.group(3) else None
+
+        if minute > 59 or hour > 23:
+            return None
+
+        if suffix:
+            if hour < 1 or hour > 12:
+                return None
+            if suffix == "PM" and hour != 12:
+                hour += 12
+            if suffix == "AM" and hour == 12:
+                hour = 0
+
+        return time(hour=hour, minute=minute)
+
+    return None
+
+
+def format_time_key(t: time) -> str:
+    return f"{t.hour:02d}:{t.minute:02d}"
+
+
+def format_time_label(t: time) -> str:
+    hour = t.hour % 12 or 12
+    suffix = "AM" if t.hour < 12 else "PM"
+    return f"{hour}:{t.minute:02d} {suffix}"
+
+
+def schedule_header_label(value) -> bool:
+    if not isinstance(value, str):
+        return False
+
+    text = value.strip().upper()
+    return bool(
+        re.fullmatch(r"[A-Z]{2}\s+\d{1,2}/\d{1,2}", text)
+        or re.fullmatch(r"[A-Z]{2}\s+\d{1,2}-\d{1,2}", text)
+    )
+
+
+def find_schedule_header_row(ws) -> int | None:
+    """
+    Detects the row containing the date/court headers.
+
+    Compatible with:
+    - Generated worksheet grids where the schedule starts on row 1.
+    - Workbooks with assignment/name rows above the schedule grid.
+    """
+    max_scan_row = min(ws.max_row, 75)
+
+    for row in range(1, max_scan_row + 1):
+        header_values = [ws.cell(row=row, column=col).value for col in range(2, ws.max_column + 1)]
+        non_empty_headers = [value for value in header_values if not is_blank_cell_value(value)]
+        text_header_count = sum(1 for value in non_empty_headers if isinstance(value, str) and value.strip())
+
+        if len(non_empty_headers) < 3:
+            continue
+
+        # Most compatible grids have court names as text. If the date label in
+        # column A is clear, allow numeric court names too.
+        if text_header_count < 3 and not schedule_header_label(ws.cell(row=row, column=1).value):
+            continue
+
+        time_offsets_below = []
+        for check_row in range(row + 1, min(ws.max_row, row + 6) + 1):
+            if parse_grid_time_value(ws.cell(row=check_row, column=1).value) is not None:
+                time_offsets_below.append(check_row - row)
+
+        if len(time_offsets_below) >= 2 and min(time_offsets_below) <= 2:
+            return row
+
+    return None
+
+
+def normalize_uploaded_match_value(value) -> str:
+    if value is None or isinstance(value, (datetime, date, time, int, float)):
+        return ""
+
+    text = str(value).strip()
+
+    if not text or parse_grid_time_value(text) is not None:
+        return ""
+
+    match_code = clean_match_name(text)
+
+    if len(match_code) < 3:
+        return ""
+
+    if not re.search(r"\d", match_code):
+        return ""
+
+    return match_code
+
+
+def normalize_court_exact_key(court_name: str) -> str:
+    clean = re.sub(r"[^A-Z0-9]", "", str(court_name or "").upper())
+    return clean or "COURT"
+
+
+def court_number(court_name: str) -> int | None:
+    match = re.search(r"(\d+)\s*$", str(court_name or "").strip())
+    return int(match.group(1)) if match else None
+
+
+def make_schedule_entry(
+    court_name: str,
+    match_time: time,
+    match_code: str,
+    source: str,
+    division_label: str = "",
+):
+    return {
+        "court_name": str(court_name or "").strip(),
+        "court_key": normalize_court_exact_key(court_name),
+        "court_number": court_number(court_name),
+        "time_key": format_time_key(match_time),
+        "time_label": format_time_label(match_time),
+        "match_code": clean_match_name(match_code),
+        "source": source,
+        "division_label": division_label or describe_match_code(match_code),
+    }
+
+
+def get_uploaded_workbook_sheet_names(uploaded_file) -> list[str]:
+    uploaded_file.seek(0)
+    wb = load_workbook(uploaded_file, read_only=True, data_only=True)
+    return wb.sheetnames
+
+
+def default_uploaded_sheet_index(sheet_names: list[str], selected_date: date) -> int:
+    if not sheet_names:
+        return 0
+
+    expected_names = {
+        sheet_name_for_date(selected_date).upper(),
+        c1_label_for_date(selected_date).upper(),
+    }
+
+    for idx, sheet_name in enumerate(sheet_names):
+        if sheet_name.upper() in expected_names:
+            return idx
+
+    return 0
+
+
+def parse_uploaded_workbook_schedule(uploaded_file, sheet_name: str | None = None) -> dict:
+    uploaded_file.seek(0)
+    wb = load_workbook(uploaded_file, data_only=True)
+
+    if sheet_name and sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+    else:
+        ws = wb[wb.sheetnames[0]]
+
+    header_row = find_schedule_header_row(ws)
+
+    if header_row is None:
+        raise ValueError(
+            "Could not find a schedule grid. Make sure the uploaded workbook has court names across the top and times down column A."
+        )
+
+    court_columns = []
+
+    for col in range(2, ws.max_column + 1):
+        value = ws.cell(row=header_row, column=col).value
+
+        if is_blank_cell_value(value):
+            continue
+
+        court_columns.append((col, str(value).strip()))
+
+    entries = []
+
+    for row in range(header_row + 1, ws.max_row + 1):
+        parsed_time = parse_grid_time_value(ws.cell(row=row, column=1).value)
+
+        if parsed_time is None:
+            continue
+
+        for col, court_name in court_columns:
+            match_code = normalize_uploaded_match_value(ws.cell(row=row, column=col).value)
+
+            if match_code:
+                entries.append(
+                    make_schedule_entry(
+                        court_name=court_name,
+                        match_time=parsed_time,
+                        match_code=match_code,
+                        source="uploaded",
+                    )
+                )
+
+    return {
+        "sheet_name": ws.title,
+        "header_row": header_row,
+        "court_count": len(court_columns),
+        "match_count": len(entries),
+        "entries": entries,
+    }
+
+
+def grid_time_for_online_match(match_start_dt: datetime, grid_times: list[datetime]) -> time:
+    rounded_dt = round_match_start_to_next_grid_time(match_start_dt, grid_times)
+
+    if rounded_dt is None:
+        rounded_dt = round_up_to_half_hour(match_start_dt)
+
+    return rounded_dt.time().replace(second=0, microsecond=0)
+
+
+def build_online_schedule_entries(match_data: dict, tz_name: str, division_settings: dict) -> list[dict]:
+    court_names, matches = flatten_matches(match_data, tz_name)
+
+    if matches:
+        sheet_date = matches[0]["start_dt"].date()
+    else:
+        sheet_date = datetime.now(ZoneInfo(tz_name)).date()
+
+    grid_start, grid_end = get_grid_start_end(sheet_date, matches, tz_name)
+    grid_times = build_grid_times(grid_start, grid_end)
+
+    entries = []
+
+    for item in matches:
+        match = item["match"]
+        match_code = build_worksheet_match_display_name(match, division_settings)
+
+        if not match_code:
+            continue
+
+        division = match.get("Division", {}) or {}
+        division_label = division.get("Name", "") or describe_match_code(match_code)
+        match_time = grid_time_for_online_match(item["start_dt"], grid_times)
+
+        entries.append(
+            make_schedule_entry(
+                court_name=item["court_name"],
+                match_time=match_time,
+                match_code=match_code,
+                source="online",
+                division_label=division_label,
+            )
+        )
+
+    return entries
+
+
+def describe_match_code(match_code: str) -> str:
+    """Best-effort human label for workbook-only match codes."""
+    code = clean_match_name(match_code)
+    age_match = re.match(r"^(\d{1,2})", code)
+
+    if not age_match:
+        return code
+
+    age = age_match.group(1)
+    remainder = code[len(age):]
+
+    abbreviation_names = {
+        "AS": "Aspire",
+        "SP": "Spirit",
+        "CL": "Classic",
+        "O": "Open",
+        "P": "Premier",
+        "E": "Elite",
+        "S": "Select",
+        "A": "Ascend",
+        "C": "Club",
+        "G": "Gold",
+        "B": "Bronze",
+        "D": "Diamond",
+        "R": "Regional",
+        "N": "National",
+        "U": "USA",
+    }
+
+    for abbreviation in sorted(abbreviation_names.keys(), key=len, reverse=True):
+        if remainder.startswith(abbreviation):
+            return f"{age} {abbreviation_names[abbreviation]}"
+
+    return code
+
+
+def build_court_aliases(uploaded_entries: list[dict], online_entries: list[dict]) -> tuple[dict, dict, list[str]]:
+    """
+    Exact court names are preferred. If exact names differ, unique trailing court
+    numbers are used as a fallback so OCCC 1 can compare to North 1 when needed.
+    """
+    uploaded_courts = {}
+    online_courts = {}
+
+    for entry in uploaded_entries:
+        uploaded_courts.setdefault(entry["court_key"], entry["court_name"])
+
+    for entry in online_entries:
+        online_courts.setdefault(entry["court_key"], entry["court_name"])
+
+    aliases = {key: key for key in online_courts.keys()}
+    canonical_names = {key: name for key, name in online_courts.items()}
+    notes = []
+
+    def unique_number_map(court_lookup: dict) -> dict:
+        grouped = defaultdict(list)
+
+        for key, name in court_lookup.items():
+            number = court_number(name)
+            if number is not None:
+                grouped[number].append((key, name))
+
+        return {
+            number: values[0]
+            for number, values in grouped.items()
+            if len(values) == 1
+        }
+
+    uploaded_by_number = unique_number_map(uploaded_courts)
+    online_by_number = unique_number_map(online_courts)
+
+    for uploaded_key, uploaded_name in uploaded_courts.items():
+        if uploaded_key in online_courts:
+            aliases[uploaded_key] = uploaded_key
+            canonical_names.setdefault(uploaded_key, online_courts[uploaded_key])
+            continue
+
+        number = court_number(uploaded_name)
+
+        if number is not None and number in uploaded_by_number and number in online_by_number:
+            online_key, online_name = online_by_number[number]
+            aliases[uploaded_key] = online_key
+            canonical_names[online_key] = online_name
+            notes.append(f"Matched uploaded court '{uploaded_name}' to online court '{online_name}' by court number.")
+        else:
+            aliases[uploaded_key] = uploaded_key
+            canonical_names.setdefault(uploaded_key, uploaded_name)
+
+    return aliases, canonical_names, notes
+
+
+def aligned_position(entry: dict, court_aliases: dict) -> tuple[str, str]:
+    return (court_aliases.get(entry["court_key"], entry["court_key"]), entry["time_key"])
+
+
+def entry_location_text(entry: dict, canonical_court_names: dict | None = None) -> str:
+    if canonical_court_names and "aligned_court_key" in entry:
+        court_name = canonical_court_names.get(entry["aligned_court_key"], entry["court_name"])
+    else:
+        court_name = entry["court_name"]
+
+    return f"{court_name} at {entry['time_label']}"
+
+
+def entries_by_position(entries: list[dict], court_aliases: dict) -> dict:
+    lookup = {}
+
+    for entry in entries:
+        aligned_key, time_key = aligned_position(entry, court_aliases)
+        entry["aligned_court_key"] = aligned_key
+        lookup[(aligned_key, time_key)] = entry
+
+    return lookup
+
+
+def entries_by_match_code(entries: list[dict]) -> dict:
+    lookup = defaultdict(list)
+
+    for entry in entries:
+        lookup[entry["match_code"]].append(entry)
+
+    return lookup
+
+
+def group_change_entries_by_court(entries: list[dict], canonical_court_names: dict) -> dict:
+    grouped = defaultdict(list)
+
+    for entry in entries:
+        court_name = canonical_court_names.get(entry.get("aligned_court_key"), entry["court_name"])
+        grouped[court_name].append(entry)
+
+    return dict(sorted(grouped.items(), key=lambda item: natural_sort_key(item[0])))
+
+
+def natural_sort_key(text: str):
+    return [int(part) if part.isdigit() else part.upper() for part in re.split(r"(\d+)", str(text))]
+
+
+def sorted_entries_by_time(entries: list[dict]) -> list[dict]:
+    return sorted(entries, key=lambda entry: (entry["time_key"], natural_sort_key(entry["match_code"])))
+
+
+def compare_schedule_structures(uploaded_entries: list[dict], online_entries: list[dict]) -> dict:
+    court_aliases, canonical_court_names, alias_notes = build_court_aliases(uploaded_entries, online_entries)
+
+    uploaded_by_position = entries_by_position(uploaded_entries, court_aliases)
+    online_by_position = entries_by_position(online_entries, court_aliases)
+    uploaded_by_code = entries_by_match_code(uploaded_entries)
+    online_by_code = entries_by_match_code(online_entries)
+
+    uploaded_codes = set(uploaded_by_code.keys())
+    online_codes = set(online_by_code.keys())
+
+    changed_positions = []
+    changed_old_codes = set()
+    changed_new_codes = set()
+
+    for position in sorted(set(uploaded_by_position.keys()) & set(online_by_position.keys())):
+        uploaded_entry = uploaded_by_position[position]
+        online_entry = online_by_position[position]
+
+        if uploaded_entry["match_code"] != online_entry["match_code"]:
+            changed_positions.append({
+                "position": position,
+                "old": uploaded_entry,
+                "new": online_entry,
+            })
+            changed_old_codes.add(uploaded_entry["match_code"])
+            changed_new_codes.add(online_entry["match_code"])
+
+    moved_matches = []
+
+    for match_code in sorted(uploaded_codes & online_codes, key=natural_sort_key):
+        uploaded_locations = {aligned_position(entry, court_aliases) for entry in uploaded_by_code[match_code]}
+        online_locations = {aligned_position(entry, court_aliases) for entry in online_by_code[match_code]}
+
+        if uploaded_locations != online_locations:
+            moved_matches.append({
+                "match_code": match_code,
+                "old_entries": uploaded_by_code[match_code],
+                "new_entries": online_by_code[match_code],
+                "division_label": online_by_code[match_code][0].get("division_label") or describe_match_code(match_code),
+            })
+
+    added_entries = [
+        entry
+        for code in sorted(online_codes - uploaded_codes, key=natural_sort_key)
+        for entry in online_by_code[code]
+        if code not in changed_new_codes
+    ]
+
+    removed_entries = [
+        entry
+        for code in sorted(uploaded_codes - online_codes, key=natural_sort_key)
+        for entry in uploaded_by_code[code]
+        if code not in changed_old_codes
+    ]
+
+    added_by_court = group_change_entries_by_court(added_entries, canonical_court_names)
+    removed_by_court = group_change_entries_by_court(removed_entries, canonical_court_names)
+
+    is_unchanged = not any([
+        added_entries,
+        removed_entries,
+        moved_matches,
+        changed_positions,
+    ])
+
+    return {
+        "is_unchanged": is_unchanged,
+        "added_entries": added_entries,
+        "removed_entries": removed_entries,
+        "added_by_court": added_by_court,
+        "removed_by_court": removed_by_court,
+        "moved_matches": moved_matches,
+        "changed_positions": changed_positions,
+        "canonical_court_names": canonical_court_names,
+        "alias_notes": alias_notes,
+        "uploaded_match_count": len(uploaded_entries),
+        "online_match_count": len(online_entries),
+    }
+
+
+def format_time_list(entries: list[dict]) -> str:
+    times = []
+    seen = set()
+
+    for entry in sorted_entries_by_time(entries):
+        if entry["time_key"] not in seen:
+            seen.add(entry["time_key"])
+            times.append(entry["time_label"])
+
+    return ", ".join(times)
+
+
+def render_grouped_change_lines(grouped_entries: dict, verb: str):
+    for court_name, entries in grouped_entries.items():
+        count = len(entries)
+        plural = "match" if count == 1 else "matches"
+        st.write(f"- **{court_name}** {verb} {count} {plural} ({format_time_list(entries)}).")
+
+
+def render_comparison_results(result: dict, uploaded_summary: dict, selected_date: date):
+    st.caption(
+        f"Compared {uploaded_summary['match_count']} uploaded matches from '{uploaded_summary['sheet_name']}' "
+        f"to {result['online_match_count']} online matches for {format_long_date(selected_date)}."
+    )
+
+    if result["alias_notes"]:
+        with st.expander("Court-name matching notes"):
+            st.write(f"Matched {len(result['alias_notes'])} uploaded courts to online courts by court number.")
+            for note in result["alias_notes"][:20]:
+                st.write(f"- {note}")
+            if len(result["alias_notes"]) > 20:
+                st.write(f"- ...and {len(result['alias_notes']) - 20} more.")
+
+    if result["is_unchanged"]:
+        st.success("✅ Grid Structure Verified & Unchanged")
+        return
+
+    st.warning("Grid structure changes found.")
+
+    if result["removed_by_court"]:
+        st.markdown("**Removed matches**")
+        render_grouped_change_lines(result["removed_by_court"], "removed")
+
+    if result["added_by_court"]:
+        st.markdown("**Added matches**")
+        render_grouped_change_lines(result["added_by_court"], "added")
+
+    if result["moved_matches"]:
+        st.markdown("**Moved matches**")
+        for move in result["moved_matches"]:
+            old_locations = ", ".join(
+                entry_location_text(entry, result["canonical_court_names"])
+                for entry in sorted_entries_by_time(move["old_entries"])
+            )
+            new_locations = ", ".join(
+                entry_location_text(entry, result["canonical_court_names"])
+                for entry in sorted_entries_by_time(move["new_entries"])
+            )
+            st.write(
+                f"- **{move['match_code']}** ({move['division_label']}) moved from {old_locations} to {new_locations}."
+            )
+
+    if result["changed_positions"]:
+        st.markdown("**Changed match/division at same court and time**")
+        for change in result["changed_positions"]:
+            old_entry = change["old"]
+            new_entry = change["new"]
+            court_name = result["canonical_court_names"].get(
+                new_entry.get("aligned_court_key"),
+                new_entry["court_name"],
+            )
+            st.write(
+                f"- **{court_name} at {new_entry['time_label']}** is now "
+                f"**{new_entry['division_label']}** ({new_entry['match_code']}); "
+                f"was **{old_entry['division_label']}** ({old_entry['match_code']})."
+            )
+
+
 # =========================
 # CREATE WORKBOOKS IN MEMORY
 # =========================
@@ -1044,7 +1635,7 @@ if event_info:
 
     st.write(
         "Set one abbreviation for each unique division level. "
-        "The app will add the age automatically. For example, Classic → C gives 11C, 12C, 13C."
+        "The app will add the age automatically. For example, Classic → CL gives 11CL, 12CL, 13CL."
     )
 
     if st.session_state.level_rows is None:
@@ -1068,7 +1659,7 @@ if event_info:
             ),
             "Abbreviation": st.column_config.TextColumn(
                 "Abbreviation",
-                help="Example: Open → O, Gold → G, Silver → S, Bronze → B",
+                help="Example: Open → O, Premier → P, Classic → CL, Aspire → AS",
                 width="small",
             ),
             "Divisions Using This Level": st.column_config.TextColumn(
@@ -1131,6 +1722,88 @@ if event_info:
                 type="primary",
                 key="download_worksheet_grid",
             )
+
+
+    st.divider()
+    st.subheader("Compare Uploaded Workbook to Online Schedule")
+    st.write(
+        "Upload a previously generated or manually edited grid workbook, choose the day/sheet, "
+        "and compare its court/time match structure to the current AES online schedule."
+    )
+
+    available_compare_dates = list(date_range(start_date, end_date))
+
+    selected_compare_date = st.selectbox(
+        "Day to compare",
+        options=available_compare_dates,
+        format_func=format_long_date,
+        key="compare_date",
+    )
+
+    uploaded_compare_workbook = st.file_uploader(
+        "Upload workbook to compare",
+        type=["xlsx", "xlsm"],
+        key="compare_workbook",
+    )
+
+    selected_compare_sheet = None
+
+    if uploaded_compare_workbook is not None:
+        try:
+            compare_sheet_names = get_uploaded_workbook_sheet_names(uploaded_compare_workbook)
+            default_sheet_index = default_uploaded_sheet_index(
+                compare_sheet_names,
+                selected_compare_date,
+            )
+
+            selected_compare_sheet = st.selectbox(
+                "Workbook sheet to read",
+                options=compare_sheet_names,
+                index=default_sheet_index,
+                key="compare_sheet",
+            )
+        except Exception as exc:
+            st.error(f"Could not read workbook sheets: {exc}")
+
+    compare_clicked = st.button(
+        "Compare Uploaded Workbook to Current Online Schedule",
+        type="secondary",
+        key="compare_schedule_button",
+    )
+
+    if compare_clicked:
+        if uploaded_compare_workbook is None:
+            st.error("Upload a workbook first.")
+        elif not selected_compare_sheet:
+            st.error("Select a worksheet from the uploaded workbook.")
+        else:
+            try:
+                with st.spinner("Comparing workbook to current AES schedule..."):
+                    uploaded_summary = parse_uploaded_workbook_schedule(
+                        uploaded_compare_workbook,
+                        selected_compare_sheet,
+                    )
+                    current_match_data = get_match_info(
+                        st.session_state.event_key,
+                        selected_compare_date,
+                    )
+                    online_entries = build_online_schedule_entries(
+                        current_match_data,
+                        TIMEZONE,
+                        division_settings,
+                    )
+                    comparison_result = compare_schedule_structures(
+                        uploaded_summary["entries"],
+                        online_entries,
+                    )
+
+                render_comparison_results(
+                    comparison_result,
+                    uploaded_summary,
+                    selected_compare_date,
+                )
+            except Exception as exc:
+                st.error(f"Could not compare schedules: {exc}")
 
 else:
     st.info("Enter an AES event key or full AES schedule URL to begin.")
