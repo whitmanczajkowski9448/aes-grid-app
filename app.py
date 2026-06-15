@@ -1602,28 +1602,58 @@ def render_comparison_results(result: dict, uploaded_summary: dict, selected_dat
 
     st.warning("Grid structure changes found.")
 
-    if result["removed_by_court"]:
+    # A moved match is a structure change in two places:
+    # - the old court/time lost that match slot
+    # - the new court/time added that match slot
+    # To keep the output language consistent, moved matches are folded into
+    # the same court-based lost/added summary instead of being rendered as
+    # separate "Age X moved from..." lines.
+    moved_old_entries = [
+        entry
+        for move in result.get("moved_matches", [])
+        for entry in move.get("old_entries", [])
+    ]
+    moved_new_entries = [
+        entry
+        for move in result.get("moved_matches", [])
+        for entry in move.get("new_entries", [])
+    ]
+
+    structure_removed_by_court = group_change_entries_by_court(
+        result.get("removed_entries", []) + moved_old_entries,
+        result["canonical_court_names"],
+    )
+    structure_added_by_court = group_change_entries_by_court(
+        result.get("added_entries", []) + moved_new_entries,
+        result["canonical_court_names"],
+    )
+
+    if structure_removed_by_court:
         st.markdown("**Lost matches**")
-        render_grouped_change_lines(result["removed_by_court"], "lost", "#C00000")
+        render_grouped_change_lines(structure_removed_by_court, "lost", "#C00000")
 
-    if result["added_by_court"]:
+    if structure_added_by_court:
         st.markdown("**Added matches**")
-        render_grouped_change_lines(result["added_by_court"], "added", "#0070C0")
+        render_grouped_change_lines(structure_added_by_court, "added", "#0070C0")
 
-    if result["moved_matches"]:
-        st.markdown("**Moved matches**")
-        for move in result["moved_matches"]:
-            old_locations = ", ".join(
-                entry_location_text(entry, result["canonical_court_names"])
-                for entry in sorted_entries_by_time(move["old_entries"])
-            )
-            new_locations = ", ".join(
-                entry_location_text(entry, result["canonical_court_names"])
-                for entry in sorted_entries_by_time(move["new_entries"])
-            )
+    if result.get("moved_matches"):
+        with st.expander("Move details"):
             st.write(
-                f"- **Age {move['match_age']}** moved from {old_locations} to {new_locations}."
+                "Moves are included above as lost slots on the original court/time "
+                "and added slots on the new court/time."
             )
+            for move in result["moved_matches"]:
+                old_locations = ", ".join(
+                    entry_location_text(entry, result["canonical_court_names"])
+                    for entry in sorted_entries_by_time(move["old_entries"])
+                )
+                new_locations = ", ".join(
+                    entry_location_text(entry, result["canonical_court_names"])
+                    for entry in sorted_entries_by_time(move["new_entries"])
+                )
+                st.write(
+                    f"- Age {move['match_age']} moved from {old_locations} to {new_locations}."
+                )
 
     if result["changed_positions"]:
         st.markdown("**Changed age at same court and time**")
