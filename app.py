@@ -486,6 +486,19 @@ def natural_sort_key(value) -> list:
     return [int(part) if part.isdigit() else part for part in parts]
 
 
+def sorted_entries_by_time(entries: list[dict]) -> list[dict]:
+    """Return schedule entries sorted by court, time, then match age/code."""
+    return sorted(
+        entries or [],
+        key=lambda entry: (
+            natural_sort_key(entry.get("court_name", "")),
+            entry.get("time_key", ""),
+            natural_sort_key(entry.get("match_age", "")),
+            natural_sort_key(entry.get("match_code", "")),
+        ),
+    )
+
+
 def copy_cell_style(source_cell, target_cell):
     if source_cell.has_style:
         target_cell.font = copy(source_cell.font)
@@ -1436,6 +1449,23 @@ def pair_age_moves(removed_candidates: list[dict], added_candidates: list[dict])
         remaining_added.extend(new_entries[pair_count:])
 
     return moved_matches, remaining_removed, remaining_added
+
+
+def group_change_entries_by_court(entries: list[dict], canonical_court_names: dict | None = None) -> dict:
+    """Group added/removed entries by the court name that should be shown to the user."""
+    grouped = defaultdict(list)
+
+    for entry in sorted_entries_by_time(entries or []):
+        court_key = entry.get("aligned_court_key") or entry.get("court_key")
+        court_name = (canonical_court_names or {}).get(court_key, entry.get("court_name", "Court"))
+        grouped[court_name].append(entry)
+
+    return dict(
+        sorted(
+            grouped.items(),
+            key=lambda item: natural_sort_key(item[0]),
+        )
+    )
 
 
 def compare_schedule_structures(uploaded_entries: list[dict], online_entries: list[dict]) -> dict:
