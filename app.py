@@ -105,6 +105,7 @@ def reset_app():
         "event_match_counts",
         "comparison_result",
         "comparison_uploaded_summary",
+        "comparison_selected_date",
         "comparison_changed_workbooks",
     ]
 
@@ -1541,11 +1542,43 @@ def format_time_list(entries: list[dict]) -> str:
     return ", ".join(times)
 
 
-def render_grouped_change_lines(grouped_entries: dict, verb: str):
+
+def count_word(count: int) -> str:
+    """Return a readable count word for the comparison summary."""
+    words = {
+        0: "zero",
+        1: "one",
+        2: "two",
+        3: "three",
+        4: "four",
+        5: "five",
+        6: "six",
+        7: "seven",
+        8: "eight",
+        9: "nine",
+        10: "ten",
+        11: "eleven",
+        12: "twelve",
+    }
+    return words.get(count, str(count))
+
+
+def render_colored_change_line(court_name: str, entries: list[dict], action: str, color: str):
+    """Render court structure changes in the requested sentence style."""
+    count = len(entries)
+    plural = "match" if count == 1 else "matches"
+    times = format_time_list(entries)
+    st.markdown(
+        f'<div style="color:{color}; font-weight:700; margin: 0.15rem 0;">'
+        f'{court_name} {action} {count_word(count)} {plural} ({times}).'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def render_grouped_change_lines(grouped_entries: dict, action: str, color: str):
     for court_name, entries in grouped_entries.items():
-        count = len(entries)
-        plural = "match" if count == 1 else "matches"
-        st.write(f"- **{court_name}** {verb} {count} {plural} ({format_time_list(entries)}).")
+        render_colored_change_line(court_name, entries, action, color)
 
 
 def render_comparison_results(result: dict, uploaded_summary: dict, selected_date: date):
@@ -1570,12 +1603,12 @@ def render_comparison_results(result: dict, uploaded_summary: dict, selected_dat
     st.warning("Grid structure changes found.")
 
     if result["removed_by_court"]:
-        st.markdown("**Removed matches**")
-        render_grouped_change_lines(result["removed_by_court"], "removed")
+        st.markdown("**Lost matches**")
+        render_grouped_change_lines(result["removed_by_court"], "lost", "#C00000")
 
     if result["added_by_court"]:
         st.markdown("**Added matches**")
-        render_grouped_change_lines(result["added_by_court"], "added")
+        render_grouped_change_lines(result["added_by_court"], "added", "#0070C0")
 
     if result["moved_matches"]:
         st.markdown("**Moved matches**")
@@ -1803,6 +1836,9 @@ if "comparison_result" not in st.session_state:
 if "comparison_uploaded_summary" not in st.session_state:
     st.session_state.comparison_uploaded_summary = None
 
+if "comparison_selected_date" not in st.session_state:
+    st.session_state.comparison_selected_date = None
+
 if "comparison_changed_workbooks" not in st.session_state:
     st.session_state.comparison_changed_workbooks = None
 
@@ -1827,6 +1863,7 @@ if fetch_clicked:
                 st.session_state.generated_workbooks = None
                 st.session_state.comparison_result = None
                 st.session_state.comparison_uploaded_summary = None
+                st.session_state.comparison_selected_date = None
                 st.session_state.comparison_changed_workbooks = None
                 st.session_state.level_rows = build_level_rows(
                     st.session_state.event_info.get("Divisions", [])
@@ -1844,6 +1881,7 @@ if fetch_clicked:
             st.session_state.event_match_counts = None
             st.session_state.comparison_result = None
             st.session_state.comparison_uploaded_summary = None
+            st.session_state.comparison_selected_date = None
             st.session_state.comparison_changed_workbooks = None
             st.error("Could not load event.")
 
@@ -2047,6 +2085,7 @@ if event_info:
 
                     st.session_state.comparison_result = comparison_result
                     st.session_state.comparison_uploaded_summary = uploaded_summary
+                    st.session_state.comparison_selected_date = selected_compare_date
                     st.session_state.comparison_changed_workbooks = None
 
                     changed_court_names = changed_court_names_from_comparison(comparison_result)
@@ -2060,16 +2099,24 @@ if event_info:
                             changed_court_names=changed_court_names,
                         )
 
-                render_comparison_results(
-                    comparison_result,
-                    uploaded_summary,
-                    selected_compare_date,
-                )
             except Exception as exc:
                 st.session_state.comparison_result = None
                 st.session_state.comparison_uploaded_summary = None
+                st.session_state.comparison_selected_date = None
                 st.session_state.comparison_changed_workbooks = None
                 st.error(f"Could not compare schedules: {exc}")
+
+    if (
+        st.session_state.comparison_result is not None
+        and st.session_state.comparison_uploaded_summary is not None
+        and st.session_state.comparison_selected_date is not None
+    ):
+        st.markdown("#### Comparison Results")
+        render_comparison_results(
+            st.session_state.comparison_result,
+            st.session_state.comparison_uploaded_summary,
+            st.session_state.comparison_selected_date,
+        )
 
     changed_downloads = st.session_state.comparison_changed_workbooks
 
