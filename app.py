@@ -46,6 +46,8 @@ DEFAULT_LEVEL_ABBREVIATIONS = {
     "ASPIRE": "AS",
     "SPIRIT": "SP",
     "CLASSIC": "CL",
+    "GIRLS": "U",
+    "GIRL": "U",
     "POWER": "P",
     "P": "P",
     "GOLD": "G",
@@ -60,9 +62,6 @@ DEFAULT_LEVEL_ABBREVIATIONS = {
     "AMERICAN": "A",
     "REGIONAL": "R",
     "USA": "U",
-    "GIRLS": "U",
-    "GIRL": "U",
-    "U": "U",
 }
 
 
@@ -106,8 +105,7 @@ def reset_app():
         "event_match_counts",
         "comparison_result",
         "comparison_uploaded_summary",
-        "comparison_selected_date",
-        "changed_court_workbooks",
+        "comparison_changed_workbooks",
     ]
 
     for key in keys_to_clear:
@@ -233,9 +231,13 @@ def determine_match_format(match: dict) -> str:
 # =========================
 
 def normalize_power_text(text: str) -> str:
+    """Normalize common words that should become compact division-code text."""
     if not text:
         return ""
 
+    text = str(text)
+
+    # AES sometimes uses words that should become code letters in our grids.
     text = re.sub(r"\bPower\b", "P", text, flags=re.IGNORECASE)
     text = re.sub(r"Power", "P", text, flags=re.IGNORECASE)
 
@@ -302,12 +304,20 @@ def default_level_abbreviation(level_name: str) -> str:
     if lookup_key in DEFAULT_LEVEL_ABBREVIATIONS:
         return DEFAULT_LEVEL_ABBREVIATIONS[lookup_key]
 
-    first_word = re.split(r"\s+", level.strip())[0]
+    words = [word for word in re.split(r"\s+", level.strip()) if word]
 
-    if not first_word:
+    if not words:
         return ""
 
-    return first_word[0].upper()
+    # If a division level starts with Girls/Girl, make that part U.
+    # Examples: Girls -> U, Girls Classic -> UCL, Girls Open -> UO.
+    first_word_key = words[0].upper()
+    if first_word_key in {"GIRLS", "GIRL"}:
+        if len(words) == 1:
+            return "U"
+        return "U" + default_level_abbreviation(" ".join(words[1:]))
+
+    return words[0][0].upper()
 
 
 def clean_match_name(raw_name: str) -> str:
@@ -315,6 +325,7 @@ def clean_match_name(raw_name: str) -> str:
     Final match-name cleaner.
 
     Rules:
+    - Convert Girls/Girl to U.
     - Remove R1, R2, R3, R4, R5, etc. anywhere in the match name.
     - Delete all lowercase letters.
     - Delete all symbols/spaces/punctuation.
@@ -324,11 +335,14 @@ def clean_match_name(raw_name: str) -> str:
     14CR1AM1 -> 14CAM1
     14Cr1aM1 -> 14CM1
     15PowerR2BM3 -> 15PBM3
+    18 Girls M1 -> 18UM1
     """
     if not raw_name:
         return ""
 
     text = normalize_power_text(str(raw_name))
+    text = re.sub(r"\bGirls\b", "U", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bGirl\b", "U", text, flags=re.IGNORECASE)
 
     # Remove round labels like R1, R2, R10 anywhere in the name.
     text = re.sub(r"R\d+", "", text)
@@ -337,27 +351,6 @@ def clean_match_name(raw_name: str) -> str:
     text = re.sub(r"[^A-Z0-9]", "", text)
 
     return text
-
-
-def match_age_key(match_code: str) -> str:
-    """
-    Age-only comparison key.
-
-    For schedule-change checks, match names are intentionally compared only by
-    the leading age code. This keeps the comparison focused on structure/age
-    changes instead of pool, round, or individual match-number naming changes.
-    """
-    code = clean_match_name(match_code)
-    return code[:2] if len(code) >= 2 else code
-
-
-def match_age_label(match_code: str) -> str:
-    age = match_age_key(match_code)
-
-    if age and age.isdigit():
-        return f"{age}U"
-
-    return age or "Match"
 
 
 def build_level_rows(divisions: list[dict]) -> list[dict]:
@@ -471,32 +464,6 @@ def build_worksheet_match_display_name(match: dict, division_settings: dict) -> 
 
 def compact_event_name(text: str) -> str:
     return re.sub(r"[^A-Za-z0-9]", "", text or "AESEvent")
-
-
-def natural_sort_key(value) -> list:
-    """
-    Sort helper that keeps numbered labels in human order.
-
-    Examples:
-    - Court 2 comes before Court 10
-    - 14U comes before 18U
-    """
-    text = str(value or "")
-    parts = re.split(r"(\d+)", text.lower())
-    return [int(part) if part.isdigit() else part for part in parts]
-
-
-def sorted_entries_by_time(entries: list[dict]) -> list[dict]:
-    """Return schedule entries sorted by court, time, then match age/code."""
-    return sorted(
-        entries or [],
-        key=lambda entry: (
-            natural_sort_key(entry.get("court_name", "")),
-            entry.get("time_key", ""),
-            natural_sort_key(entry.get("match_age", "")),
-            natural_sort_key(entry.get("match_code", "")),
-        ),
-    )
 
 
 def copy_cell_style(source_cell, target_cell):
@@ -690,6 +657,48 @@ def flatten_matches(match_data: dict, tz_name: str):
             )
 
     return court_names, matches
+
+
+def count_matches_in_match_data(match_data: dict) -> int:
+    return sum(
+        len(court.get("CourtMatches", []) or [])
+        for court in match_data.get("CourtSchedules", []) or []
+    )
+
+
+def build_event_match_count_summary(event_key: str, event_info: dict) -> dict:
+    start_date = parse_event_date(event_info["StartDate"])
+    end_date = parse_event_date(event_info["EndDate"])
+
+    by_day = []
+    total = 0
+
+    for event_date in date_range(start_date, end_date):
+        match_data = get_match_info(event_key, event_date)
+        count = count_matches_in_match_data(match_data)
+        total += count
+        by_day.append({"date": event_date, "count": count})
+
+    return {"by_day": by_day, "total": total}
+
+
+def render_event_match_counts(match_counts: dict):
+    if not match_counts:
+        return
+
+    st.metric("Total Matches", match_counts.get("total", 0))
+
+    day_rows = [
+        {
+            "Day": format_long_date(row["date"]),
+            "Matches": row["count"],
+        }
+        for row in match_counts.get("by_day", [])
+    ]
+
+    if day_rows:
+        st.markdown("**Match Count by Day**")
+        st.table(day_rows)
 
 
 def get_grid_start_end(sheet_date: date, matches: list, tz_name: str):
@@ -1091,6 +1100,19 @@ def court_number(court_name: str) -> int | None:
     return int(match.group(1)) if match else None
 
 
+def match_age_key(match_code: str) -> str:
+    """Use only the leading age for comparison, per requested rule."""
+    code = clean_match_name(match_code)
+
+    # Volleyball divisions should normally start with a two-digit age.
+    match = re.match(r"^(\d{2})", code)
+    if match:
+        return match.group(1)
+
+    # Fallback for unusual values: first two cleaned characters.
+    return code[:2]
+
+
 def make_schedule_entry(
     court_name: str,
     match_time: time,
@@ -1098,17 +1120,19 @@ def make_schedule_entry(
     source: str,
     division_label: str = "",
 ):
+    clean_code = clean_match_name(match_code)
+    age = match_age_key(clean_code)
+
     return {
         "court_name": str(court_name or "").strip(),
         "court_key": normalize_court_exact_key(court_name),
         "court_number": court_number(court_name),
         "time_key": format_time_key(match_time),
         "time_label": format_time_label(match_time),
-        "match_code": clean_match_name(match_code),
-        "match_age": match_age_key(match_code),
-        "match_age_label": match_age_label(match_code),
+        "match_code": clean_code,
+        "match_age": age,
         "source": source,
-        "division_label": division_label or describe_match_code(match_code),
+        "division_label": division_label or describe_match_code(clean_code),
     }
 
 
@@ -1360,115 +1384,39 @@ def entries_by_match_code(entries: list[dict]) -> dict:
     return lookup
 
 
-def entries_by_match_age(entries: list[dict]) -> dict:
-    lookup = defaultdict(list)
-
-    for entry in entries:
-        lookup[entry["match_age"]].append(entry)
-
-    return lookup
-
-
-def entry_aligned_court_key(entry: dict, court_aliases: dict | None = None) -> str:
-    if "aligned_court_key" in entry:
-        return entry["aligned_court_key"]
-
-    if court_aliases:
-        return court_aliases.get(entry["court_key"], entry["court_key"])
-
-    return entry["court_key"]
-
-
-def collect_changed_court_keys(*entry_groups) -> set[str]:
-    changed_keys = set()
-
-    for group in entry_groups:
-        if not group:
-            continue
-
-        if isinstance(group, dict):
-            group = group.values()
-
-        for item in group:
-            if isinstance(item, dict) and "old" in item and "new" in item:
-                changed_keys.add(entry_aligned_court_key(item["old"]))
-                changed_keys.add(entry_aligned_court_key(item["new"]))
-            elif isinstance(item, dict) and "old_entries" in item and "new_entries" in item:
-                for entry in item["old_entries"] + item["new_entries"]:
-                    changed_keys.add(entry_aligned_court_key(entry))
-            elif isinstance(item, dict) and "court_key" in item:
-                changed_keys.add(entry_aligned_court_key(item))
-            elif isinstance(item, list):
-                for entry in item:
-                    if isinstance(entry, dict) and "court_key" in entry:
-                        changed_keys.add(entry_aligned_court_key(entry))
-
-    return changed_keys
-
-
-def pair_age_moves(removed_candidates: list[dict], added_candidates: list[dict]) -> tuple[list[dict], list[dict], list[dict]]:
-    """
-    Pair possible moves using age only.
-
-    Because the comparison intentionally ignores full match names, this treats a
-    removed 18U position and an added 18U position as a likely move. When there
-    are multiple of the same age, entries are paired by time/court sort order.
-    """
-    removed_by_age = defaultdict(list)
-    added_by_age = defaultdict(list)
-
-    for entry in removed_candidates:
-        removed_by_age[entry["match_age"]].append(entry)
-
-    for entry in added_candidates:
-        added_by_age[entry["match_age"]].append(entry)
-
-    moved_matches = []
-    remaining_removed = []
-    remaining_added = []
-
-    all_ages = sorted(set(removed_by_age) | set(added_by_age), key=natural_sort_key)
-
-    for age in all_ages:
-        old_entries = sorted_entries_by_time(removed_by_age.get(age, []))
-        new_entries = sorted_entries_by_time(added_by_age.get(age, []))
-        pair_count = min(len(old_entries), len(new_entries))
-
-        for idx in range(pair_count):
-            old_entry = old_entries[idx]
-            new_entry = new_entries[idx]
-            moved_matches.append({
-                "match_age": age,
-                "match_age_label": new_entry.get("match_age_label") or old_entry.get("match_age_label") or match_age_label(age),
-                "old_entries": [old_entry],
-                "new_entries": [new_entry],
-                "division_label": new_entry.get("match_age_label") or old_entry.get("match_age_label") or match_age_label(age),
-            })
-
-        remaining_removed.extend(old_entries[pair_count:])
-        remaining_added.extend(new_entries[pair_count:])
-
-    return moved_matches, remaining_removed, remaining_added
-
-
-def group_change_entries_by_court(entries: list[dict], canonical_court_names: dict | None = None) -> dict:
-    """Group added/removed entries by the court name that should be shown to the user."""
+def group_change_entries_by_court(entries: list[dict], canonical_court_names: dict) -> dict:
     grouped = defaultdict(list)
 
-    for entry in sorted_entries_by_time(entries or []):
-        court_key = entry.get("aligned_court_key") or entry.get("court_key")
-        court_name = (canonical_court_names or {}).get(court_key, entry.get("court_name", "Court"))
+    for entry in entries:
+        court_name = canonical_court_names.get(entry.get("aligned_court_key"), entry["court_name"])
         grouped[court_name].append(entry)
 
-    return dict(
-        sorted(
-            grouped.items(),
-            key=lambda item: natural_sort_key(item[0]),
-        )
+    return dict(sorted(grouped.items(), key=lambda item: natural_sort_key(item[0])))
+
+
+def natural_sort_key(text: str):
+    return [int(part) if part.isdigit() else part.upper() for part in re.split(r"(\d+)", str(text))]
+
+
+def sorted_entries_by_time(entries: list[dict]) -> list[dict]:
+    return sorted(
+        entries,
+        key=lambda entry: (
+            entry.get("time_key", ""),
+            natural_sort_key(entry.get("match_age", "")),
+            natural_sort_key(entry.get("match_code", "")),
+        ),
     )
 
 
 def compare_schedule_structures(uploaded_entries: list[dict], online_entries: list[dict]) -> dict:
+    """
+    Compare the uploaded grid to the online schedule by court/time structure.
+
+    Match-name comparison intentionally uses only the age key, which is the first
+    two cleaned characters of the match name/code. This means 18CLM1 vs 18PM1
+    is treated as unchanged at the same court/time because both are age 18.
+    """
     court_aliases, canonical_court_names, alias_notes = build_court_aliases(uploaded_entries, online_entries)
 
     uploaded_by_position = entries_by_position(uploaded_entries, court_aliases)
@@ -1483,38 +1431,52 @@ def compare_schedule_structures(uploaded_entries: list[dict], online_entries: li
         uploaded_entry = uploaded_by_position[position]
         online_entry = online_by_position[position]
 
-        # Match-name comparisons are age-only by request.
-        if uploaded_entry["match_age"] != online_entry["match_age"]:
+        if uploaded_entry.get("match_age") != online_entry.get("match_age"):
             changed_positions.append({
                 "position": position,
                 "old": uploaded_entry,
                 "new": online_entry,
             })
 
-    removed_candidates = [
-        uploaded_by_position[position]
-        for position in sorted(uploaded_positions - online_positions)
-    ]
+    candidate_removed = [uploaded_by_position[position] for position in sorted(uploaded_positions - online_positions)]
+    candidate_added = [online_by_position[position] for position in sorted(online_positions - uploaded_positions)]
 
-    added_candidates = [
-        online_by_position[position]
-        for position in sorted(online_positions - uploaded_positions)
-    ]
+    removed_by_age = defaultdict(list)
+    added_by_age = defaultdict(list)
 
-    moved_matches, removed_entries, added_entries = pair_age_moves(
-        removed_candidates,
-        added_candidates,
-    )
+    for entry in candidate_removed:
+        removed_by_age[entry.get("match_age", "")].append(entry)
+
+    for entry in candidate_added:
+        added_by_age[entry.get("match_age", "")].append(entry)
+
+    moved_matches = []
+    moved_removed_ids = set()
+    moved_added_ids = set()
+
+    for age in sorted(set(removed_by_age.keys()) & set(added_by_age.keys()), key=natural_sort_key):
+        old_entries = sorted_entries_by_time(removed_by_age[age])
+        new_entries = sorted_entries_by_time(added_by_age[age])
+        pair_count = min(len(old_entries), len(new_entries))
+
+        for idx in range(pair_count):
+            old_entry = old_entries[idx]
+            new_entry = new_entries[idx]
+            moved_removed_ids.add(id(old_entry))
+            moved_added_ids.add(id(new_entry))
+            moved_matches.append({
+                "match_age": age,
+                "match_code": age,
+                "old_entries": [old_entry],
+                "new_entries": [new_entry],
+                "division_label": f"Age {age}" if age else "Unknown age",
+            })
+
+    added_entries = [entry for entry in candidate_added if id(entry) not in moved_added_ids]
+    removed_entries = [entry for entry in candidate_removed if id(entry) not in moved_removed_ids]
 
     added_by_court = group_change_entries_by_court(added_entries, canonical_court_names)
     removed_by_court = group_change_entries_by_court(removed_entries, canonical_court_names)
-
-    changed_court_keys = collect_changed_court_keys(
-        added_entries,
-        removed_entries,
-        moved_matches,
-        changed_positions,
-    )
 
     is_unchanged = not any([
         added_entries,
@@ -1522,11 +1484,6 @@ def compare_schedule_structures(uploaded_entries: list[dict], online_entries: li
         moved_matches,
         changed_positions,
     ])
-
-    changed_court_names = [
-        canonical_court_names.get(key, key)
-        for key in sorted(changed_court_keys, key=lambda value: natural_sort_key(canonical_court_names.get(value, value)))
-    ]
 
     return {
         "is_unchanged": is_unchanged,
@@ -1536,13 +1493,40 @@ def compare_schedule_structures(uploaded_entries: list[dict], online_entries: li
         "removed_by_court": removed_by_court,
         "moved_matches": moved_matches,
         "changed_positions": changed_positions,
-        "changed_court_keys": changed_court_keys,
-        "changed_court_names": changed_court_names,
         "canonical_court_names": canonical_court_names,
         "alias_notes": alias_notes,
         "uploaded_match_count": len(uploaded_entries),
         "online_match_count": len(online_entries),
     }
+
+
+def changed_court_names_from_comparison(result: dict) -> set[str]:
+    changed_names = set()
+    canonical_court_names = result.get("canonical_court_names", {})
+
+    def add_entry(entry: dict):
+        aligned_key = entry.get("aligned_court_key") or entry.get("court_key")
+        name = canonical_court_names.get(aligned_key, entry.get("court_name", ""))
+        if name:
+            changed_names.add(str(name).strip())
+
+    for entry in result.get("added_entries", []):
+        add_entry(entry)
+
+    for entry in result.get("removed_entries", []):
+        add_entry(entry)
+
+    for move in result.get("moved_matches", []):
+        for entry in move.get("old_entries", []):
+            add_entry(entry)
+        for entry in move.get("new_entries", []):
+            add_entry(entry)
+
+    for change in result.get("changed_positions", []):
+        add_entry(change.get("old", {}))
+        add_entry(change.get("new", {}))
+
+    return changed_names
 
 
 def format_time_list(entries: list[dict]) -> str:
@@ -1568,7 +1552,7 @@ def render_comparison_results(result: dict, uploaded_summary: dict, selected_dat
     st.caption(
         f"Compared {uploaded_summary['match_count']} uploaded matches from '{uploaded_summary['sheet_name']}' "
         f"to {result['online_match_count']} online matches for {format_long_date(selected_date)}. "
-        "Match-name differences are compared by age only using the first two characters of the cleaned match name."
+        "Match-code comparisons use age only."
     )
 
     if result["alias_notes"]:
@@ -1605,7 +1589,7 @@ def render_comparison_results(result: dict, uploaded_summary: dict, selected_dat
                 for entry in sorted_entries_by_time(move["new_entries"])
             )
             st.write(
-                f"- **{move['match_age_label']}** moved from {old_locations} to {new_locations}."
+                f"- **Age {move['match_age']}** moved from {old_locations} to {new_locations}."
             )
 
     if result["changed_positions"]:
@@ -1619,11 +1603,13 @@ def render_comparison_results(result: dict, uploaded_summary: dict, selected_dat
             )
             st.write(
                 f"- **{court_name} at {new_entry['time_label']}** is now "
-                f"**{new_entry['match_age_label']}**; was **{old_entry['match_age_label']}**."
+                f"**Age {new_entry.get('match_age', '')}**; "
+                f"was **Age {old_entry.get('match_age', '')}**."
             )
 
 
 # =========================
+# CREATE WORKBOOKS IN MEMORY# =========================
 # CREATE WORKBOOKS IN MEMORY
 # =========================
 
@@ -1689,73 +1675,46 @@ def create_workbooks(event_key: str, event_info: dict, division_settings: dict):
     }
 
 
-# =========================
-# MATCH COUNTS / CHANGED-COURT WORKBOOKS
-# =========================
+def court_name_is_in_changed_set(court_name: str, changed_court_names: set[str]) -> bool:
+    if not changed_court_names:
+        return False
 
-def count_matches_in_match_data(match_data: dict) -> int:
-    return sum(
-        len(court.get("CourtMatches", []) or [])
-        for court in match_data.get("CourtSchedules", []) or []
+    exact_names = {str(name).strip() for name in changed_court_names}
+    exact_keys = {normalize_court_exact_key(name) for name in changed_court_names}
+    changed_numbers = {court_number(name) for name in changed_court_names}
+    changed_numbers.discard(None)
+
+    return (
+        str(court_name or "").strip() in exact_names
+        or normalize_court_exact_key(court_name) in exact_keys
+        or court_number(court_name) in changed_numbers
     )
 
 
-def get_event_match_counts_by_day(event_key: str, event_info: dict) -> dict:
-    start_date = parse_event_date(event_info["StartDate"])
-    end_date = parse_event_date(event_info["EndDate"])
-
-    rows = []
-    total = 0
-
-    for event_date in date_range(start_date, end_date):
-        match_data = get_match_info(event_key, event_date)
-        count = count_matches_in_match_data(match_data)
-        total += count
-        rows.append({
-            "Date": format_long_date(event_date),
-            "Sheet": sheet_name_for_date(event_date),
-            "Match Count": count,
-        })
-
-    return {
-        "rows": rows,
-        "total": total,
-    }
-
-
-def filter_match_data_to_court_keys(match_data: dict, included_court_keys: set[str]) -> dict:
-    included_court_keys = set(included_court_keys or [])
-
-    filtered = copy(match_data)
-    filtered_court_schedules = []
-
-    for court in match_data.get("CourtSchedules", []) or []:
-        court_key = normalize_court_exact_key(court.get("Name", ""))
-
-        if court_key in included_court_keys:
-            filtered_court_schedules.append(court)
-
-    filtered["CourtSchedules"] = filtered_court_schedules
+def filter_match_data_to_courts(match_data: dict, changed_court_names: set[str]) -> dict:
+    filtered = dict(match_data or {})
+    filtered["CourtSchedules"] = [
+        court
+        for court in (match_data or {}).get("CourtSchedules", []) or []
+        if court_name_is_in_changed_set(court.get("Name", ""), changed_court_names)
+    ]
     return filtered
 
 
 def create_changed_court_workbooks(
     event_info: dict,
-    event_date: date,
+    sheet_date: date,
     match_data: dict,
     division_settings: dict,
-    changed_court_keys: set[str],
+    changed_court_names: set[str],
 ):
-    if not changed_court_keys:
-        return None
-
     event_name = event_info.get("Name", "AESEvent")
     event_name_no_spaces = compact_event_name(event_name)
-    date_suffix = event_date.strftime("%m%d")
     suffix = timestamp_suffix(TIMEZONE)
+    date_suffix = sheet_date.strftime("%m%d")
 
-    filtered_match_data = filter_match_data_to_court_keys(match_data, changed_court_keys)
     template_ws, template_theme = load_template_sheet_and_theme(TEMPLATE_PATH)
+    filtered_match_data = filter_match_data_to_courts(match_data, changed_court_names)
 
     assignment_wb = Workbook()
     assignment_wb.remove(assignment_wb.active)
@@ -1767,12 +1726,12 @@ def create_changed_court_workbooks(
         assignment_wb.loaded_theme = template_theme
         worksheet_wb.loaded_theme = template_theme
 
-    sheet_name = sheet_name_for_date(event_date)
+    sheet_name = sheet_name_for_date(sheet_date)
 
     assignment_ws = assignment_wb.create_sheet(title=sheet_name)
     build_assignment_grid_sheet(
         ws=assignment_ws,
-        sheet_date=event_date,
+        sheet_date=sheet_date,
         match_data=filtered_match_data,
         tz_name=TIMEZONE,
         division_settings=division_settings,
@@ -1782,18 +1741,21 @@ def create_changed_court_workbooks(
     worksheet_ws = worksheet_wb.create_sheet(title=sheet_name)
     build_worksheet_grid_sheet(
         ws=worksheet_ws,
-        sheet_date=event_date,
+        sheet_date=sheet_date,
         match_data=filtered_match_data,
         tz_name=TIMEZONE,
         division_settings=division_settings,
     )
 
+    court_count = len(filtered_match_data.get("CourtSchedules", []) or [])
+
     return {
+        "changed_court_count": court_count,
+        "changed_court_names": sorted(changed_court_names, key=natural_sort_key),
         "assignment_filename": f"ChangedCourts_AssignmentGrid_{event_name_no_spaces}_{date_suffix}{suffix}.xlsx",
         "assignment_bytes": save_workbook_to_bytes(assignment_wb),
         "worksheet_filename": f"ChangedCourts_WorksheetGrid_{event_name_no_spaces}_{date_suffix}{suffix}.xlsx",
         "worksheet_bytes": save_workbook_to_bytes(worksheet_wb),
-        "court_count": len(filtered_match_data.get("CourtSchedules", []) or []),
     }
 
 
@@ -1841,11 +1803,8 @@ if "comparison_result" not in st.session_state:
 if "comparison_uploaded_summary" not in st.session_state:
     st.session_state.comparison_uploaded_summary = None
 
-if "comparison_selected_date" not in st.session_state:
-    st.session_state.comparison_selected_date = None
-
-if "changed_court_workbooks" not in st.session_state:
-    st.session_state.changed_court_workbooks = None
+if "comparison_changed_workbooks" not in st.session_state:
+    st.session_state.comparison_changed_workbooks = None
 
 
 event_input = st.text_input(
@@ -1868,12 +1827,11 @@ if fetch_clicked:
                 st.session_state.generated_workbooks = None
                 st.session_state.comparison_result = None
                 st.session_state.comparison_uploaded_summary = None
-                st.session_state.comparison_selected_date = None
-                st.session_state.changed_court_workbooks = None
+                st.session_state.comparison_changed_workbooks = None
                 st.session_state.level_rows = build_level_rows(
                     st.session_state.event_info.get("Divisions", [])
                 )
-                st.session_state.event_match_counts = get_event_match_counts_by_day(
+                st.session_state.event_match_counts = build_event_match_count_summary(
                     clean_key,
                     st.session_state.event_info,
                 )
@@ -1886,8 +1844,7 @@ if fetch_clicked:
             st.session_state.event_match_counts = None
             st.session_state.comparison_result = None
             st.session_state.comparison_uploaded_summary = None
-            st.session_state.comparison_selected_date = None
-            st.session_state.changed_court_workbooks = None
+            st.session_state.comparison_changed_workbooks = None
             st.error("Could not load event.")
 
 
@@ -1902,29 +1859,31 @@ if event_info:
     st.subheader("Event Information")
     st.markdown(f"### {event_name}")
 
-    c1, c2, c3, c4 = st.columns([1.3, 1.3, 2.8, 1.2])
+    c1, c2, c3 = st.columns([1.3, 1.3, 2.8])
 
     c1.metric("Start Date", format_long_date(start_date))
     c2.metric("End Date", format_long_date(end_date))
     c3.metric("Location", location or "Not listed")
 
-    match_counts = st.session_state.event_match_counts
-    if match_counts:
-        c4.metric("Total Matches", match_counts["total"])
-    else:
-        c4.metric("Total Matches", "—")
-
     st.caption(f"AES event key: `{st.session_state.event_key}`")
 
-    if match_counts and match_counts.get("rows"):
-        with st.expander("Match count by day", expanded=True):
-            st.table(match_counts["rows"])
+    if st.session_state.event_match_counts is None:
+        try:
+            with st.spinner("Counting matches by day..."):
+                st.session_state.event_match_counts = build_event_match_count_summary(
+                    st.session_state.event_key,
+                    event_info,
+                )
+        except Exception as exc:
+            st.warning(f"Could not load match counts: {exc}")
+
+    render_event_match_counts(st.session_state.event_match_counts)
 
     st.subheader("Division Level Abbreviations")
 
     st.write(
         "Set one abbreviation for each unique division level. "
-        "The app will add the age automatically. For example, Classic → CL gives 11CL, 12CL, 13CL."
+        "The app will add the age automatically. For example, Classic → CL gives 11CL, 12CL, 13CL. Girls → U."
     )
 
     if st.session_state.level_rows is None:
@@ -1948,7 +1907,7 @@ if event_info:
             ),
             "Abbreviation": st.column_config.TextColumn(
                 "Abbreviation",
-                help="Example: Open → O, Premier → P, Classic → CL, Aspire → AS",
+                help="Example: Open → O, Premier → P, Classic → CL, Aspire → AS, Girls → U",
                 width="small",
             ),
             "Divisions Using This Level": st.column_config.TextColumn(
@@ -2086,68 +2045,61 @@ if event_info:
                         online_entries,
                     )
 
-                    changed_workbooks = None
-                    if comparison_result["changed_court_keys"]:
-                        changed_workbooks = create_changed_court_workbooks(
+                    st.session_state.comparison_result = comparison_result
+                    st.session_state.comparison_uploaded_summary = uploaded_summary
+                    st.session_state.comparison_changed_workbooks = None
+
+                    changed_court_names = changed_court_names_from_comparison(comparison_result)
+
+                    if changed_court_names:
+                        st.session_state.comparison_changed_workbooks = create_changed_court_workbooks(
                             event_info=event_info,
-                            event_date=selected_compare_date,
+                            sheet_date=selected_compare_date,
                             match_data=current_match_data,
                             division_settings=division_settings,
-                            changed_court_keys=comparison_result["changed_court_keys"],
+                            changed_court_names=changed_court_names,
                         )
 
-                st.session_state.comparison_result = comparison_result
-                st.session_state.comparison_uploaded_summary = uploaded_summary
-                st.session_state.comparison_selected_date = selected_compare_date
-                st.session_state.changed_court_workbooks = changed_workbooks
+                render_comparison_results(
+                    comparison_result,
+                    uploaded_summary,
+                    selected_compare_date,
+                )
             except Exception as exc:
                 st.session_state.comparison_result = None
                 st.session_state.comparison_uploaded_summary = None
-                st.session_state.comparison_selected_date = None
-                st.session_state.changed_court_workbooks = None
+                st.session_state.comparison_changed_workbooks = None
                 st.error(f"Could not compare schedules: {exc}")
 
-    if (
-        st.session_state.comparison_result
-        and st.session_state.comparison_uploaded_summary
-        and st.session_state.comparison_selected_date
-    ):
-        render_comparison_results(
-            st.session_state.comparison_result,
-            st.session_state.comparison_uploaded_summary,
-            st.session_state.comparison_selected_date,
+    changed_downloads = st.session_state.comparison_changed_workbooks
+
+    if changed_downloads:
+        st.markdown("#### Changed-Court Downloads")
+        st.caption(
+            f"These files include only the {changed_downloads['changed_court_count']} court(s) with detected changes."
         )
 
-        changed_workbooks = st.session_state.changed_court_workbooks
-        if changed_workbooks:
-            changed_names = st.session_state.comparison_result.get("changed_court_names", [])
-            st.markdown("#### Changed-Court Downloads")
-            st.caption(
-                f"These files include only the {changed_workbooks['court_count']} court(s) with detected changes: "
-                + ", ".join(changed_names)
+        cd1, cd2 = st.columns(2)
+
+        with cd1:
+            st.download_button(
+                label="Download Changed Courts Assignment Grid",
+                data=changed_downloads["assignment_bytes"],
+                file_name=changed_downloads["assignment_filename"],
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="primary",
+                key="download_changed_assignment_grid",
             )
 
-            cd1, cd2 = st.columns(2)
-
-            with cd1:
-                st.download_button(
-                    label="Download Changed Courts Assignment Grid",
-                    data=changed_workbooks["assignment_bytes"],
-                    file_name=changed_workbooks["assignment_filename"],
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    type="primary",
-                    key="download_changed_assignment_grid",
-                )
-
-            with cd2:
-                st.download_button(
-                    label="Download Changed Courts Worksheet Grid",
-                    data=changed_workbooks["worksheet_bytes"],
-                    file_name=changed_workbooks["worksheet_filename"],
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    type="primary",
-                    key="download_changed_worksheet_grid",
-                )
+        with cd2:
+            st.download_button(
+                label="Download Changed Courts Worksheet Grid",
+                data=changed_downloads["worksheet_bytes"],
+                file_name=changed_downloads["worksheet_filename"],
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="primary",
+                key="download_changed_worksheet_grid",
+            )
 
 else:
     st.info("Enter an AES event key or full AES schedule URL to begin.")
