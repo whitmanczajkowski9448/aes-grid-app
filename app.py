@@ -473,6 +473,19 @@ def compact_event_name(text: str) -> str:
     return re.sub(r"[^A-Za-z0-9]", "", text or "AESEvent")
 
 
+def natural_sort_key(value) -> list:
+    """
+    Sort helper that keeps numbered labels in human order.
+
+    Examples:
+    - Court 2 comes before Court 10
+    - 14U comes before 18U
+    """
+    text = str(value or "")
+    parts = re.split(r"(\d+)", text.lower())
+    return [int(part) if part.isdigit() else part for part in parts]
+
+
 def copy_cell_style(source_cell, target_cell):
     if source_cell.has_style:
         target_cell.font = copy(source_cell.font)
