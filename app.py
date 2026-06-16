@@ -66,6 +66,28 @@ DEFAULT_LEVEL_ABBREVIATIONS = {
 
 
 # =========================
+# QUICK EVENT BUTTONS
+# =========================
+# Replace the url values below with full AES schedule URLs or raw AES event keys.
+# Leave url blank or set active to False to gray out that button.
+PRESET_EVENT_BUTTON_ROWS = [
+    [
+        {"label": "AAU Wave 1", "url": "https://results.advancedeventsystems.com/event/PTAwMDAwNDUwMjY90/home?_gl=1*11ee7ca*_ga*MjA1MjMzMTg2Ny4xNzY2NzgwNjUz*_ga_PQ25JN9PJ8*czE3ODE2NTM3NjkkbzkyJGcxJHQxNzgxNjUzOTYxJGo0MCRsMCRoMA..&_ga=2.65442030.1738899225.1781380090-2052331867.1766780653", "active": True},
+        {"label": "AAU Wave 2", "url": "https://results.advancedeventsystems.com/event/PTAwMDAwNDUwMjc90/home?_gl=1*11ei72s*_ga*MjA1MjMzMTg2Ny4xNzY2NzgwNjUz*_ga_PQ25JN9PJ8*czE3ODE2NTM3NjkkbzkyJGcxJHQxNzgxNjUzOTc5JGoyMiRsMCRoMA..&_ga=2.68547665.1738899225.1781380090-2052331867.1766780653", "active": True},
+        {"label": "AAU Wave 3", "url": "", "active": False},
+        {"label": "AAU Wave 4", "url": "", "active": False},
+        {"label": "AAU Wave 5", "url": "", "active": False},
+        {"label": "AAU Wave 6", "url": "", "active": False},
+    ],
+    [
+        {"label": "USAV GJNC 11-13", "url": "https://results.advancedeventsystems.com//event/PTAwMDAwNDE5NTg90?_gl=1*1v32ep9*_ga*MjA1MjMzMTg2Ny4xNzY2NzgwNjUz*_ga_PQ25JN9PJ8*czE3ODE2NTM3NjkkbzkyJGcxJHQxNzgxNjUzOTQxJGo2MCRsMCRoMA..&_ga=2.65442030.1738899225.1781380090-2052331867.1766780653", "active": True},
+        {"label": "USAV GJNC 14-17", "url": "", "active": False},
+        {"label": "USAV BJNC", "url": "", "active": False},
+    ],
+]
+
+
+# =========================
 # INPUT HELPERS
 # =========================
 
@@ -99,6 +121,7 @@ def reset_app():
     keys_to_clear = [
         "event_info",
         "event_key",
+        "event_input_value",
         "generated_workbooks",
         "level_rows",
         "level_editor",
@@ -1851,6 +1874,9 @@ if "event_info" not in st.session_state:
 if "event_key" not in st.session_state:
     st.session_state.event_key = ""
 
+if "event_input_value" not in st.session_state:
+    st.session_state.event_input_value = ""
+
 if "generated_workbooks" not in st.session_state:
     st.session_state.generated_workbooks = None
 
@@ -1873,47 +1899,91 @@ if "comparison_changed_workbooks" not in st.session_state:
     st.session_state.comparison_changed_workbooks = None
 
 
+def clear_loaded_event_state():
+    st.session_state.event_info = None
+    st.session_state.generated_workbooks = None
+    st.session_state.level_rows = None
+    st.session_state.event_match_counts = None
+    st.session_state.comparison_result = None
+    st.session_state.comparison_uploaded_summary = None
+    st.session_state.comparison_selected_date = None
+    st.session_state.comparison_changed_workbooks = None
+
+
+def load_event_from_input(raw_input: str, source_label: str = "event"):
+    clean_key = extract_event_key(raw_input)
+
+    if not clean_key:
+        st.error("Enter an event key or URL.")
+        return
+
+    try:
+        with st.spinner(f"Loading {source_label}..."):
+            st.session_state.event_info = get_event_info(clean_key)
+            st.session_state.event_key = clean_key
+            st.session_state.event_input_value = raw_input
+            st.session_state.generated_workbooks = None
+            st.session_state.comparison_result = None
+            st.session_state.comparison_uploaded_summary = None
+            st.session_state.comparison_selected_date = None
+            st.session_state.comparison_changed_workbooks = None
+            st.session_state.level_rows = build_level_rows(
+                st.session_state.event_info.get("Divisions", [])
+            )
+            st.session_state.event_match_counts = build_event_match_count_summary(
+                clean_key,
+                st.session_state.event_info,
+            )
+
+        st.success(f"Loaded {source_label}.")
+    except Exception:
+        clear_loaded_event_state()
+        st.error(f"Could not load {source_label}.")
+
+
+def preset_event_is_active(preset_event: dict) -> bool:
+    return bool(str(preset_event.get("url", "")).strip()) and bool(preset_event.get("active", True))
+
+
+def render_preset_event_buttons():
+    st.markdown("#### Quick Event Links")
+
+    for row_index, preset_row in enumerate(PRESET_EVENT_BUTTON_ROWS):
+        columns = st.columns(len(preset_row))
+
+        for column, preset_event in zip(columns, preset_row):
+            label = preset_event.get("label", "Event")
+            url = str(preset_event.get("url", "")).strip()
+            is_active = preset_event_is_active(preset_event)
+            help_text = "Load this preset event." if is_active else "No active link is configured for this button."
+
+            with column:
+                clicked = st.button(
+                    label,
+                    key=f"preset_event_{row_index}_{label}",
+                    use_container_width=True,
+                    disabled=not is_active,
+                    help=help_text,
+                )
+
+            if clicked:
+                st.session_state.event_input_value = url
+                load_event_from_input(url, label)
+
+
+render_preset_event_buttons()
+st.divider()
+
 event_input = st.text_input(
     "AES Event Key or Schedule URL",
     placeholder="Example: PTAwMDAwNDEzMjQ90 or https://results.advancedeventsystems.com/event/PTAwMDAwNDEzMjQ90/home",
+    key="event_input_value",
 )
 
 fetch_clicked = st.button("Fetch Event", type="primary")
 
 if fetch_clicked:
-    clean_key = extract_event_key(event_input)
-
-    if not clean_key:
-        st.error("Enter an event key or URL.")
-    else:
-        try:
-            with st.spinner("Loading..."):
-                st.session_state.event_info = get_event_info(clean_key)
-                st.session_state.event_key = clean_key
-                st.session_state.generated_workbooks = None
-                st.session_state.comparison_result = None
-                st.session_state.comparison_uploaded_summary = None
-                st.session_state.comparison_selected_date = None
-                st.session_state.comparison_changed_workbooks = None
-                st.session_state.level_rows = build_level_rows(
-                    st.session_state.event_info.get("Divisions", [])
-                )
-                st.session_state.event_match_counts = build_event_match_count_summary(
-                    clean_key,
-                    st.session_state.event_info,
-                )
-
-            st.success("Loaded.")
-        except Exception:
-            st.session_state.event_info = None
-            st.session_state.generated_workbooks = None
-            st.session_state.level_rows = None
-            st.session_state.event_match_counts = None
-            st.session_state.comparison_result = None
-            st.session_state.comparison_uploaded_summary = None
-            st.session_state.comparison_selected_date = None
-            st.session_state.comparison_changed_workbooks = None
-            st.error("Could not load event.")
+    load_event_from_input(event_input, "event")
 
 
 event_info = st.session_state.event_info
