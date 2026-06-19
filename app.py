@@ -16,6 +16,7 @@ from openpyxl.utils import get_column_letter
 
 # =========================
 # APP SETTINGS
+# UPDATED: Assignment Grid row-selection popup + Start Over callback fix
 # =========================
 
 BASE_URL = "https://results.advancedeventsystems.com/api/event"
@@ -217,7 +218,6 @@ def reset_app():
         if key in st.session_state:
             del st.session_state[key]
 
-    st.rerun()
 
 
 # =========================
@@ -2237,7 +2237,6 @@ def render_assignment_download_options(
 
     if st.button("Close", key="close_assignment_download_options", use_container_width=True):
         st.session_state.show_assignment_download_options = False
-        st.rerun()
 
 
 def preset_event_is_active(preset_event: dict) -> bool:
