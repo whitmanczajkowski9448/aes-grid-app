@@ -24,7 +24,75 @@ MATCH_ENDPOINT_CONSTANT = "240"
 TEMPLATE_PATH = "GRID EXAMPLE.xlsx"
 TIMEZONE = "America/New_York"
 
-ROLE_ROWS = ["match", "format", "R1", "R2", "LJ", "LJ", "SK", "AS"]
+ASSIGNMENT_ROLE_OPTIONS = [
+    {
+        "id": "match",
+        "checkbox_label": "Match name",
+        "grid_label": "match",
+        "template_offset": 0,
+    },
+    {
+        "id": "format",
+        "checkbox_label": "Format",
+        "grid_label": "format",
+        "template_offset": 1,
+    },
+    {
+        "id": "r1",
+        "checkbox_label": "R1",
+        "grid_label": "R1",
+        "template_offset": 2,
+    },
+    {
+        "id": "r2",
+        "checkbox_label": "R2",
+        "grid_label": "R2",
+        "template_offset": 3,
+    },
+    {
+        "id": "lj1",
+        "checkbox_label": "LJ 1",
+        "grid_label": "LJ",
+        "template_offset": 4,
+    },
+    {
+        "id": "lj2",
+        "checkbox_label": "LJ 2",
+        "grid_label": "LJ",
+        "template_offset": 5,
+    },
+    {
+        "id": "sk",
+        "checkbox_label": "SK",
+        "grid_label": "SK",
+        "template_offset": 6,
+    },
+    {
+        "id": "as",
+        "checkbox_label": "AS",
+        "grid_label": "AS",
+        "template_offset": 7,
+    },
+]
+
+DEFAULT_ASSIGNMENT_ROLE_IDS = [option["id"] for option in ASSIGNMENT_ROLE_OPTIONS]
+ROLE_ROWS = [option["grid_label"] for option in ASSIGNMENT_ROLE_OPTIONS]
+
+
+def assignment_role_options_from_ids(selected_role_ids: list[str] | None = None) -> list[dict]:
+    """Return assignment-grid row options in the normal row order."""
+    if selected_role_ids is None:
+        selected_role_ids = DEFAULT_ASSIGNMENT_ROLE_IDS
+
+    selected_ids = set(selected_role_ids)
+    selected_options = [
+        option
+        for option in ASSIGNMENT_ROLE_OPTIONS
+        if option["id"] in selected_ids
+    ]
+
+    # Always return at least one row so the workbook structure remains valid.
+    return selected_options or [ASSIGNMENT_ROLE_OPTIONS[0]]
 
 WEEKDAY_ABBREVIATIONS = {
     0: "MO",
@@ -117,7 +185,20 @@ def extract_event_key(user_input: str) -> str:
     return text
 
 
+def clear_assignment_download_state():
+    keys_to_clear = [
+        "assignment_download_custom",
+        "show_assignment_download_options",
+    ]
+
+    for key in list(st.session_state.keys()):
+        if key.startswith("assignment_row_include_") or key in keys_to_clear:
+            del st.session_state[key]
+
+
 def reset_app():
+    clear_assignment_download_state()
+
     keys_to_clear = [
         "event_info",
         "event_key",
@@ -528,11 +609,18 @@ def load_template_sheet_and_theme(template_path: str | None):
     return template_ws, template_theme
 
 
-def template_row_for_output_row(output_row: int) -> int:
+def template_row_for_output_row(
+    output_row: int,
+    assignment_role_options: list[dict] | None = None,
+) -> int:
     if output_row == 1:
         return 1
 
-    return 2 + ((output_row - 2) % len(ROLE_ROWS))
+    role_options = assignment_role_options or ASSIGNMENT_ROLE_OPTIONS
+    role_index = (output_row - 2) % len(role_options)
+    template_offset = role_options[role_index].get("template_offset", role_index)
+
+    return 2 + template_offset
 
 
 def clear_unused_match_cell_fills(ws, start_row: int, max_row: int, start_col: int, max_col: int):
@@ -547,7 +635,12 @@ def clear_unused_match_cell_fills(ws, start_row: int, max_row: int, start_col: i
                 cell.fill = PatternFill(fill_type=None)
 
 
-def apply_template_columns_a_to_d(ws, template_ws, max_row: int):
+def apply_template_columns_a_to_d(
+    ws,
+    template_ws,
+    max_row: int,
+    assignment_role_options: list[dict] | None = None,
+):
     if template_ws is None:
         apply_builtin_columns_a_to_d_style(ws, max_row)
         return
@@ -557,7 +650,7 @@ def apply_template_columns_a_to_d(ws, template_ws, max_row: int):
         ws.column_dimensions[letter].width = template_ws.column_dimensions[letter].width
 
     for row in range(1, max_row + 1):
-        template_row = template_row_for_output_row(row)
+        template_row = template_row_for_output_row(row, assignment_role_options)
 
         if template_ws.row_dimensions[template_row].height is not None:
             ws.row_dimensions[row].height = template_ws.row_dimensions[template_row].height
@@ -632,7 +725,14 @@ def apply_template_court_header_style(ws, template_ws, start_col: int, end_col: 
         ws.column_dimensions[get_column_letter(col)].width = source_width
 
 
-def apply_template_match_area_style(ws, template_ws, start_col: int, end_col: int, max_row: int):
+def apply_template_match_area_style(
+    ws,
+    template_ws,
+    start_col: int,
+    end_col: int,
+    max_row: int,
+    assignment_role_options: list[dict] | None = None,
+):
     if template_ws is None:
         for row in range(2, max_row + 1):
             for col in range(start_col, end_col + 1):
@@ -643,7 +743,7 @@ def apply_template_match_area_style(ws, template_ws, start_col: int, end_col: in
         return
 
     for row in range(2, max_row + 1):
-        template_row = template_row_for_output_row(row)
+        template_row = template_row_for_output_row(row, assignment_role_options)
 
         for col in range(start_col, end_col + 1):
             copy_cell_style(
@@ -776,11 +876,24 @@ def find_time_row_for_match(match_start_dt: datetime, time_lookup: dict):
 # ASSIGNMENT GRID WORKBOOK
 # =========================
 
-def build_assignment_time_grid(ws, sheet_date: date, grid_start: datetime, grid_end: datetime):
+def build_assignment_time_grid(
+    ws,
+    sheet_date: date,
+    grid_start: datetime,
+    grid_end: datetime,
+    assignment_role_options: list[dict] | None = None,
+):
+    role_options = assignment_role_options or ASSIGNMENT_ROLE_OPTIONS
+
     ws["A1"] = "Notes"
     ws["B1"] = "Notes"
     ws["C1"] = c1_label_for_date(sheet_date)
     ws["D1"] = None
+
+    role_output_offsets = {
+        option["id"]: offset
+        for offset, option in enumerate(role_options)
+    }
 
     time_to_base_row = {}
     grid_times = build_grid_times(grid_start, grid_end)
@@ -793,12 +906,12 @@ def build_assignment_time_grid(ws, sheet_date: date, grid_start: datetime, grid_
         time_cell.value = grid_time.time()
         time_cell.number_format = "h:mm AM/PM"
 
-        for offset, label in enumerate(ROLE_ROWS):
-            ws.cell(row=row + offset, column=4).value = label
+        for offset, option in enumerate(role_options):
+            ws.cell(row=row + offset, column=4).value = option["grid_label"]
 
-        row += len(ROLE_ROWS)
+        row += len(role_options)
 
-    return time_to_base_row, row - 1
+    return time_to_base_row, row - 1, role_output_offsets
 
 
 def build_assignment_grid_sheet(
@@ -808,25 +921,35 @@ def build_assignment_grid_sheet(
     tz_name: str,
     division_settings: dict,
     template_ws=None,
+    assignment_role_options: list[dict] | None = None,
 ):
+    role_options = assignment_role_options or ASSIGNMENT_ROLE_OPTIONS
     court_names, matches = flatten_matches(match_data, tz_name)
     grid_start, grid_end = get_grid_start_end(sheet_date, matches, tz_name)
 
-    time_to_base_row, max_row = build_assignment_time_grid(
+    time_to_base_row, max_row, role_output_offsets = build_assignment_time_grid(
         ws,
         sheet_date,
         grid_start,
         grid_end,
+        role_options,
     )
 
     start_court_col = 5
     end_court_col = start_court_col + len(court_names) - 1
 
-    apply_template_columns_a_to_d(ws, template_ws, max_row)
+    apply_template_columns_a_to_d(ws, template_ws, max_row, role_options)
 
     if court_names:
         apply_template_court_header_style(ws, template_ws, start_court_col, end_court_col)
-        apply_template_match_area_style(ws, template_ws, start_court_col, end_court_col, max_row)
+        apply_template_match_area_style(
+            ws,
+            template_ws,
+            start_court_col,
+            end_court_col,
+            max_row,
+            role_options,
+        )
 
     for idx, court_name in enumerate(court_names):
         col = start_court_col + idx
@@ -847,23 +970,30 @@ def build_assignment_grid_sheet(
 
         col = court_to_col[court_name]
 
-        match_cell = ws.cell(row=base_row, column=col)
-        format_cell = ws.cell(row=base_row + 1, column=col)
-
         match_name = build_assignment_match_display_name(match, division_settings)
 
         if match_name:
-            match_cell.value = match_name
-            match_cell.font = Font(name="Calibri", size=11, bold=True)
-            match_cell.alignment = Alignment(horizontal="center", vertical="center")
-
             correction = get_division_correction(match, division_settings)
             fill_color = normalize_hex_color(correction["color"])
-            match_cell.fill = PatternFill(fill_type="solid", fgColor=fill_color)
 
-            format_cell.value = determine_match_format(match)
-            format_cell.font = Font(name="Calibri", size=11, bold=False)
-            format_cell.alignment = Alignment(horizontal="center", vertical="center")
+            if "match" in role_output_offsets:
+                match_cell = ws.cell(
+                    row=base_row + role_output_offsets["match"],
+                    column=col,
+                )
+                match_cell.value = match_name
+                match_cell.font = Font(name="Calibri", size=11, bold=True)
+                match_cell.alignment = Alignment(horizontal="center", vertical="center")
+                match_cell.fill = PatternFill(fill_type="solid", fgColor=fill_color)
+
+            if "format" in role_output_offsets:
+                format_cell = ws.cell(
+                    row=base_row + role_output_offsets["format"],
+                    column=col,
+                )
+                format_cell.value = determine_match_format(match)
+                format_cell.font = Font(name="Calibri", size=11, bold=False)
+                format_cell.alignment = Alignment(horizontal="center", vertical="center")
 
     if court_names:
         clear_unused_match_cell_fills(
@@ -1706,11 +1836,61 @@ def save_workbook_to_bytes(wb: Workbook) -> bytes:
     return output.getvalue()
 
 
-def create_workbooks(event_key: str, event_info: dict, division_settings: dict):
+def create_assignment_grid_file(
+    event_key: str,
+    event_info: dict,
+    division_settings: dict,
+    assignment_role_ids: list[str] | None = None,
+    filename_prefix: str = "AssignmentGrid",
+):
+    event_name = event_info.get("Name", "AESEvent")
+    start_date = parse_event_date(event_info["StartDate"])
+    end_date = parse_event_date(event_info["EndDate"])
+    role_options = assignment_role_options_from_ids(assignment_role_ids)
+
+    template_ws, template_theme = load_template_sheet_and_theme(TEMPLATE_PATH)
+
+    assignment_wb = Workbook()
+    assignment_wb.remove(assignment_wb.active)
+
+    if template_theme:
+        assignment_wb.loaded_theme = template_theme
+
+    for event_date in date_range(start_date, end_date):
+        sheet_name = sheet_name_for_date(event_date)
+        match_data = get_match_info(event_key, event_date)
+
+        assignment_ws = assignment_wb.create_sheet(title=sheet_name)
+        build_assignment_grid_sheet(
+            ws=assignment_ws,
+            sheet_date=event_date,
+            match_data=match_data,
+            tz_name=TIMEZONE,
+            division_settings=division_settings,
+            template_ws=template_ws,
+            assignment_role_options=role_options,
+        )
+
+    event_name_no_spaces = compact_event_name(event_name)
+    suffix = timestamp_suffix(TIMEZONE)
+
+    return {
+        "assignment_filename": f"{filename_prefix}_{event_name_no_spaces}{suffix}.xlsx",
+        "assignment_bytes": save_workbook_to_bytes(assignment_wb),
+    }
+
+
+def create_workbooks(
+    event_key: str,
+    event_info: dict,
+    division_settings: dict,
+    assignment_role_ids: list[str] | None = None,
+):
     event_name = event_info.get("Name", "AESEvent")
 
     start_date = parse_event_date(event_info["StartDate"])
     end_date = parse_event_date(event_info["EndDate"])
+    role_options = assignment_role_options_from_ids(assignment_role_ids)
 
     template_ws, template_theme = load_template_sheet_and_theme(TEMPLATE_PATH)
 
@@ -1736,6 +1916,7 @@ def create_workbooks(event_key: str, event_info: dict, division_settings: dict):
             tz_name=TIMEZONE,
             division_settings=division_settings,
             template_ws=template_ws,
+            assignment_role_options=role_options,
         )
 
         worksheet_ws = worksheet_wb.create_sheet(title=sheet_name)
@@ -1900,6 +2081,7 @@ if "comparison_changed_workbooks" not in st.session_state:
 
 
 def clear_loaded_event_state():
+    clear_assignment_download_state()
     st.session_state.event_info = None
     st.session_state.generated_workbooks = None
     st.session_state.level_rows = None
@@ -1918,6 +2100,7 @@ def load_event_from_input(raw_input: str, source_label: str = "event"):
         return
 
     try:
+        clear_assignment_download_state()
         with st.spinner(f"Loading {source_label}..."):
             st.session_state.event_info = get_event_info(clean_key)
             st.session_state.event_key = clean_key
@@ -1939,6 +2122,122 @@ def load_event_from_input(raw_input: str, source_label: str = "event"):
     except Exception:
         clear_loaded_event_state()
         st.error(f"Could not load {source_label}.")
+
+
+def selected_assignment_role_ids_from_checkboxes(prefix: str = "assignment_row_include") -> list[str]:
+    selected_role_ids = []
+
+    st.write(
+        "Choose which rows should be included in the Assignment Grid. "
+        "All rows are checked by default."
+    )
+
+    checkbox_columns = st.columns(2)
+
+    for index, option in enumerate(ASSIGNMENT_ROLE_OPTIONS):
+        key = f"{prefix}_{option['id']}"
+        with checkbox_columns[index % 2]:
+            is_selected = st.checkbox(
+                option["checkbox_label"],
+                value=True,
+                key=key,
+            )
+
+        if is_selected:
+            selected_role_ids.append(option["id"])
+
+    return selected_role_ids
+
+
+def assignment_download_signature(
+    event_key: str,
+    division_settings: dict,
+    selected_role_ids: list[str],
+) -> tuple:
+    division_signature = tuple(
+        sorted(
+            (
+                str(division_id),
+                str(settings.get("abbreviation", "")),
+                str(settings.get("color", "")),
+            )
+            for division_id, settings in (division_settings or {}).items()
+        )
+    )
+
+    return event_key, tuple(selected_role_ids), division_signature
+
+
+def render_assignment_download_options(
+    event_key: str,
+    event_info: dict,
+    division_settings: dict,
+):
+    selected_role_ids = selected_assignment_role_ids_from_checkboxes()
+    signature = assignment_download_signature(
+        event_key,
+        division_settings,
+        selected_role_ids,
+    )
+
+    if not selected_role_ids:
+        st.error("Select at least one row before preparing the download.")
+        prepare_disabled = True
+    else:
+        selected_labels = [
+            option["checkbox_label"]
+            for option in ASSIGNMENT_ROLE_OPTIONS
+            if option["id"] in set(selected_role_ids)
+        ]
+        st.caption(f"Rows selected: {', '.join(selected_labels)}")
+        prepare_disabled = False
+
+    prepare_clicked = st.button(
+        "Prepare Assignment Grid Download",
+        type="primary",
+        disabled=prepare_disabled,
+        key="prepare_custom_assignment_download",
+        use_container_width=True,
+    )
+
+    if prepare_clicked:
+        try:
+            with st.spinner("Preparing Assignment Grid download..."):
+                custom_file = create_assignment_grid_file(
+                    event_key=event_key,
+                    event_info=event_info,
+                    division_settings=division_settings,
+                    assignment_role_ids=selected_role_ids,
+                )
+
+            st.session_state.assignment_download_custom = {
+                "signature": signature,
+                "role_ids": selected_role_ids,
+                **custom_file,
+            }
+            st.success("Assignment Grid is ready to download.")
+        except Exception as exc:
+            st.session_state.assignment_download_custom = None
+            st.error(f"Could not prepare Assignment Grid download: {exc}")
+
+    prepared_download = st.session_state.get("assignment_download_custom")
+
+    if prepared_download and prepared_download.get("signature") == signature:
+        st.download_button(
+            label="Download Assignment Grid",
+            data=prepared_download["assignment_bytes"],
+            file_name=prepared_download["assignment_filename"],
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary",
+            key="download_custom_assignment_grid",
+            use_container_width=True,
+        )
+    elif prepared_download:
+        st.info("Selections changed. Prepare the download again before downloading.")
+
+    if st.button("Close", key="close_assignment_download_options", use_container_width=True):
+        st.session_state.show_assignment_download_options = False
+        st.rerun()
 
 
 def preset_event_is_active(preset_event: dict) -> bool:
@@ -2070,6 +2369,7 @@ if event_info:
 
     if generate_clicked:
         try:
+            clear_assignment_download_state()
             with st.spinner("Generating..."):
                 st.session_state.generated_workbooks = create_workbooks(
                     event_key=st.session_state.event_key,
@@ -2090,14 +2390,16 @@ if event_info:
         d1, d2 = st.columns(2)
 
         with d1:
-            st.download_button(
-                label="Download Assignment Grid",
-                data=generated["assignment_bytes"],
-                file_name=generated["assignment_filename"],
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            assignment_options_clicked = st.button(
+                "Download Assignment Grid",
                 type="primary",
-                key="download_assignment_grid",
+                key="open_assignment_download_options",
+                use_container_width=True,
             )
+
+            if assignment_options_clicked:
+                st.session_state.show_assignment_download_options = True
+                st.session_state.assignment_download_custom = None
 
         with d2:
             st.download_button(
@@ -2107,7 +2409,29 @@ if event_info:
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 type="primary",
                 key="download_worksheet_grid",
+                use_container_width=True,
             )
+
+        if st.session_state.get("show_assignment_download_options"):
+            dialog_decorator = getattr(st, "dialog", None) or getattr(st, "experimental_dialog", None)
+
+            if dialog_decorator:
+                @dialog_decorator("Assignment Grid Download Options")
+                def assignment_download_dialog():
+                    render_assignment_download_options(
+                        event_key=st.session_state.event_key,
+                        event_info=event_info,
+                        division_settings=division_settings,
+                    )
+
+                assignment_download_dialog()
+            else:
+                with st.expander("Assignment Grid Download Options", expanded=True):
+                    render_assignment_download_options(
+                        event_key=st.session_state.event_key,
+                        event_info=event_info,
+                        division_settings=division_settings,
+                    )
 
 
     st.divider()
