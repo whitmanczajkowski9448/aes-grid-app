@@ -149,7 +149,7 @@ PRESET_EVENT_BUTTON_ROWS = [
         {"label": "AAU Wave 6", "url": "", "active": False},
     ],
     [
-        {"label": "USAV GJNC 11-13", "url": "https://results.advancedeventsystems.com//event/PTAwMDAwNDE5NTg90?_gl=1*1v32ep9*_ga*MjA1MjMzMTg2Ny4xNzY2NzgwNjUz*_ga_PQ25JN9PJ8*czE3ODE2NTM3NjkkbzkyJGcxJHQxNzgxNjUzOTQxJGo2MCRsMCRoMA..&_ga=2.65442030.1738899225.1781380090-2052331867.1766780653", "active": True},
+        {"label": "USAV GJNC 11-13", "url": "https://results.advancedeventsystems.com//event/PTAwMDAwNDE5NTg90?_gl=1*1v32ep9*_ga*MjA1MjMzMTg2Ny4xNzY2NzgwNjUz*_ga_PQ25JN9PJ8*czE3ODE2NTM3NjkkbzkyJGcxJHQxNzgxNjUzOTQxJGo2MCRsMCRoMA..&_ga=2.65442030.1738899225.1781380090-2052331867.1766780653", "active": False},
         {"label": "USAV GJNC 14-17", "url": "https://results.advancedeventsystems.com/event/PTAwMDAwNDIwNjI90/court-schedule", "active": True},
         {"label": "USAV BJNC", "url": "", "active": False},
     ],
