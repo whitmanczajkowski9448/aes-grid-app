@@ -144,7 +144,7 @@ PRESET_EVENT_BUTTON_ROWS = [
         {"label": "AAU Wave 1", "url": "https://results.advancedeventsystems.com/event/PTAwMDAwNDUwMjY90/home?_gl=1*11ee7ca*_ga*MjA1MjMzMTg2Ny4xNzY2NzgwNjUz*_ga_PQ25JN9PJ8*czE3ODE2NTM3NjkkbzkyJGcxJHQxNzgxNjUzOTYxJGo0MCRsMCRoMA..&_ga=2.65442030.1738899225.1781380090-2052331867.1766780653", "active": False},
         {"label": "AAU Wave 2", "url": "https://results.advancedeventsystems.com/event/PTAwMDAwNDUwMjc90/home?_gl=1*11ei72s*_ga*MjA1MjMzMTg2Ny4xNzY2NzgwNjUz*_ga_PQ25JN9PJ8*czE3ODE2NTM3NjkkbzkyJGcxJHQxNzgxNjUzOTc5JGoyMiRsMCRoMA..&_ga=2.68547665.1738899225.1781380090-2052331867.1766780653", "active": False},
         {"label": "AAU Wave 3", "url": "https://results.advancedeventsystems.com/event/PTAwMDAwNDUwMjg90/court-schedule", "active": True},
-        {"label": "AAU Wave 4", "url": "", "https://results.advancedeventsystems.com/event/PTAwMDAwNDUwMjk90/court-schedule": True},
+        {"label": "AAU Wave 4", "url": "https://results.advancedeventsystems.com/event/PTAwMDAwNDUwMjk90/court-schedule", "active": True},
         {"label": "AAU Wave 5", "url": "", "active": False},
         {"label": "AAU Wave 6", "url": "", "active": False},
     ],
