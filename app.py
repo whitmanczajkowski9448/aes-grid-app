@@ -1521,27 +1521,145 @@ def match_age_key(match_code: str) -> str:
     return code[:2]
 
 
+def level_abbreviation_candidates() -> list[str]:
+    """Return known level abbreviations, longest first, for parsing existing workbook codes."""
+    candidates = {
+        clean_match_name(value)
+        for value in DEFAULT_LEVEL_ABBREVIATIONS.values()
+        if clean_match_name(value)
+    }
+    return sorted(candidates, key=lambda value: (-len(value), natural_sort_key(value)))
+
+
+def division_codes_from_settings(division_settings: dict | None) -> set[str]:
+    """Return configured age+level prefixes such as 14CL, 15O, or 18P."""
+    codes = set()
+
+    for settings in (division_settings or {}).values():
+        code = clean_match_name(str(settings.get("abbreviation", "")))
+        if code:
+            codes.add(code)
+
+    return codes
+
+
+def split_match_division_component(
+    match_code: str,
+    division_codes: set[str] | None = None,
+) -> tuple[str, str, str]:
+    """
+    Split the leading division component from a compact match code.
+
+    Returns (division_code, age, level_code). Examples:
+    - 14CLM1 with known/default abbreviations -> (14CL, 14, CL)
+    - 18PM3 -> (18P, 18, P)
+    - 16SLAM2 with a configured 16SL prefix -> (16SL, 16, SL)
+    """
+    code = clean_match_name(match_code)
+
+    if not code:
+        return "", "", ""
+
+    cleaned_division_codes = {
+        clean_match_name(value)
+        for value in (division_codes or set())
+        if clean_match_name(value)
+    }
+
+    for division_code in sorted(cleaned_division_codes, key=lambda value: (-len(value), natural_sort_key(value))):
+        if code.startswith(division_code):
+            age_match = re.match(r"^(\d{1,2})", division_code)
+            age = age_match.group(1) if age_match else match_age_key(code)
+            level_code = division_code[len(age):] if age else division_code
+            return division_code, age, level_code
+
+    age_match = re.match(r"^(\d{1,2})", code)
+
+    if not age_match:
+        return "", match_age_key(code), ""
+
+    age = age_match.group(1)
+    remainder = code[len(age):]
+
+    for level_code in level_abbreviation_candidates():
+        if remainder.startswith(level_code):
+            return f"{age}{level_code}", age, level_code
+
+    return age, age, ""
+
+
+def describe_division_component(division_code: str, age: str = "", level_code: str = "") -> str:
+    if division_code and level_code:
+        return describe_match_code(division_code)
+
+    if age:
+        return f"Age {age}"
+
+    return "Unknown division"
+
+
+def add_match_level_fields(entry: dict, division_codes: set[str] | None = None) -> dict:
+    """Add age/level comparison fields to a parsed schedule entry."""
+    division_code, age, level_code = split_match_division_component(
+        entry.get("match_code", ""),
+        division_codes,
+    )
+
+    age = age or entry.get("match_age", "") or match_age_key(entry.get("match_code", ""))
+    division_key = division_code or age
+    level_label = describe_division_component(division_code, age, level_code)
+
+    entry["match_age"] = age
+    entry["match_level_code"] = level_code
+    entry["match_division_code"] = division_code
+    entry["match_division_key"] = division_key
+    entry["match_level_label"] = level_label
+
+    if not entry.get("division_label"):
+        entry["division_label"] = level_label
+
+    return entry
+
+
+def enrich_entries_for_level_comparison(entries: list[dict], division_codes: set[str] | None = None) -> list[dict]:
+    for entry in entries or []:
+        add_match_level_fields(entry, division_codes)
+
+    return entries or []
+
+
+def comparison_match_key(entry: dict) -> str:
+    """Use the leading age+level division component for comparison and move pairing."""
+    return entry.get("match_division_key") or entry.get("match_age", "")
+
+
 def make_schedule_entry(
     court_name: str,
     match_time: time,
     match_code: str,
     source: str,
     division_label: str = "",
+    division_codes: set[str] | None = None,
 ):
     clean_code = clean_match_name(match_code)
-    age = match_age_key(clean_code)
 
-    return {
+    entry = {
         "court_name": str(court_name or "").strip(),
         "court_key": normalize_court_exact_key(court_name),
         "court_number": court_number(court_name),
         "time_key": format_time_key(match_time),
         "time_label": format_time_label(match_time),
         "match_code": clean_code,
-        "match_age": age,
         "source": source,
-        "division_label": division_label or describe_match_code(clean_code),
+        "division_label": division_label,
     }
+
+    add_match_level_fields(entry, division_codes)
+
+    if not entry.get("division_label"):
+        entry["division_label"] = entry.get("match_level_label") or describe_match_code(clean_code)
+
+    return entry
 
 
 def get_uploaded_workbook_sheet_names(uploaded_file) -> list[str]:
@@ -1633,6 +1751,7 @@ def grid_time_for_online_match(match_start_dt: datetime, grid_times: list[dateti
 
 def build_online_schedule_entries(match_data: dict, tz_name: str, division_settings: dict) -> list[dict]:
     court_names, matches = flatten_matches(match_data, tz_name)
+    known_division_codes = division_codes_from_settings(division_settings)
 
     if matches:
         sheet_date = matches[0]["start_dt"].date()
@@ -1662,6 +1781,7 @@ def build_online_schedule_entries(match_data: dict, tz_name: str, division_setti
                 match_code=match_code,
                 source="online",
                 division_label=division_label,
+                division_codes=known_division_codes,
             )
         )
 
@@ -1817,14 +1937,22 @@ def sorted_entries_by_time(entries: list[dict]) -> list[dict]:
     )
 
 
-def compare_schedule_structures(uploaded_entries: list[dict], online_entries: list[dict]) -> dict:
+def compare_schedule_structures(
+    uploaded_entries: list[dict],
+    online_entries: list[dict],
+    division_settings: dict | None = None,
+) -> dict:
     """
-    Compare the uploaded grid to the online schedule by court/time structure.
+    Compare the uploaded grid to the online schedule by court/time and by the
+    leading age+level division component of the compact match code.
 
-    Match-name comparison intentionally uses only the age key, which is the first
-    two cleaned characters of the match name/code. This means 18CLM1 vs 18PM1
-    is treated as unchanged at the same court/time because both are age 18.
+    Example: 18CLM1 and 18PM1 are now flagged at the same court/time because
+    the level code changed from CL to P, even though the age stayed 18.
     """
+    known_division_codes = division_codes_from_settings(division_settings)
+    enrich_entries_for_level_comparison(uploaded_entries, known_division_codes)
+    enrich_entries_for_level_comparison(online_entries, known_division_codes)
+
     court_aliases, canonical_court_names, alias_notes = build_court_aliases(uploaded_entries, online_entries)
 
     uploaded_by_position = entries_by_position(uploaded_entries, court_aliases)
@@ -1839,32 +1967,41 @@ def compare_schedule_structures(uploaded_entries: list[dict], online_entries: li
         uploaded_entry = uploaded_by_position[position]
         online_entry = online_by_position[position]
 
-        if uploaded_entry.get("match_age") != online_entry.get("match_age"):
+        old_key = comparison_match_key(uploaded_entry)
+        new_key = comparison_match_key(online_entry)
+
+        if old_key != new_key:
+            change_type = "level"
+
+            if uploaded_entry.get("match_age") != online_entry.get("match_age"):
+                change_type = "age/level"
+
             changed_positions.append({
                 "position": position,
                 "old": uploaded_entry,
                 "new": online_entry,
+                "change_type": change_type,
             })
 
     candidate_removed = [uploaded_by_position[position] for position in sorted(uploaded_positions - online_positions)]
     candidate_added = [online_by_position[position] for position in sorted(online_positions - uploaded_positions)]
 
-    removed_by_age = defaultdict(list)
-    added_by_age = defaultdict(list)
+    removed_by_key = defaultdict(list)
+    added_by_key = defaultdict(list)
 
     for entry in candidate_removed:
-        removed_by_age[entry.get("match_age", "")].append(entry)
+        removed_by_key[comparison_match_key(entry)].append(entry)
 
     for entry in candidate_added:
-        added_by_age[entry.get("match_age", "")].append(entry)
+        added_by_key[comparison_match_key(entry)].append(entry)
 
     moved_matches = []
     moved_removed_ids = set()
     moved_added_ids = set()
 
-    for age in sorted(set(removed_by_age.keys()) & set(added_by_age.keys()), key=natural_sort_key):
-        old_entries = sorted_entries_by_time(removed_by_age[age])
-        new_entries = sorted_entries_by_time(added_by_age[age])
+    for match_key in sorted(set(removed_by_key.keys()) & set(added_by_key.keys()), key=natural_sort_key):
+        old_entries = sorted_entries_by_time(removed_by_key[match_key])
+        new_entries = sorted_entries_by_time(added_by_key[match_key])
         pair_count = min(len(old_entries), len(new_entries))
 
         for idx in range(pair_count):
@@ -1873,11 +2010,16 @@ def compare_schedule_structures(uploaded_entries: list[dict], online_entries: li
             moved_removed_ids.add(id(old_entry))
             moved_added_ids.add(id(new_entry))
             moved_matches.append({
-                "match_age": age,
-                "match_code": age,
+                "match_key": match_key,
+                "match_age": old_entry.get("match_age") or new_entry.get("match_age", ""),
+                "match_code": match_key,
                 "old_entries": [old_entry],
                 "new_entries": [new_entry],
-                "division_label": f"Age {age}" if age else "Unknown age",
+                "division_label": (
+                    old_entry.get("match_level_label")
+                    or new_entry.get("match_level_label")
+                    or f"Age {old_entry.get('match_age', '')}"
+                ),
             })
 
     added_entries = [entry for entry in candidate_added if id(entry) not in moved_added_ids]
@@ -1988,11 +2130,104 @@ def render_grouped_change_lines(grouped_entries: dict, action: str, color: str):
         render_colored_change_line(court_name, entries, action, color)
 
 
+def change_court_name(entry: dict, canonical_court_names: dict) -> str:
+    aligned_key = entry.get("aligned_court_key") or entry.get("court_key")
+    return canonical_court_names.get(aligned_key, entry.get("court_name", ""))
+
+
+def add_court_change(grouped: dict, court_name: str, time_key: str, line: str):
+    grouped[court_name].append({
+        "time_key": time_key,
+        "line": line,
+    })
+
+
+def build_changes_by_court(result: dict) -> dict:
+    grouped = defaultdict(list)
+    canonical_court_names = result.get("canonical_court_names", {})
+
+    for entry in result.get("removed_entries", []):
+        court_name = change_court_name(entry, canonical_court_names)
+        add_court_change(
+            grouped,
+            court_name,
+            entry.get("time_key", ""),
+            f"{entry['time_label']}: {entry['match_code']} was removed from this court/time.",
+        )
+
+    for entry in result.get("added_entries", []):
+        court_name = change_court_name(entry, canonical_court_names)
+        add_court_change(
+            grouped,
+            court_name,
+            entry.get("time_key", ""),
+            f"{entry['time_label']}: {entry['match_code']} is new at this court/time.",
+        )
+
+    for move in result.get("moved_matches", []):
+        old_entries = move.get("old_entries", [])
+        new_entries = move.get("new_entries", [])
+
+        for old_entry, new_entry in zip(old_entries, new_entries):
+            old_court = change_court_name(old_entry, canonical_court_names)
+            new_court = change_court_name(new_entry, canonical_court_names)
+            move_label = move.get("division_label") or old_entry.get("match_level_label") or old_entry.get("match_code", "Match")
+
+            if old_court == new_court:
+                add_court_change(
+                    grouped,
+                    old_court,
+                    old_entry.get("time_key", ""),
+                    f"{old_entry['time_label']} → {new_entry['time_label']}: {move_label} moved within this court.",
+                )
+            else:
+                add_court_change(
+                    grouped,
+                    old_court,
+                    old_entry.get("time_key", ""),
+                    f"{old_entry['time_label']}: {move_label} moved to {new_court} at {new_entry['time_label']}.",
+                )
+                add_court_change(
+                    grouped,
+                    new_court,
+                    new_entry.get("time_key", ""),
+                    f"{new_entry['time_label']}: {move_label} moved from {old_court} at {old_entry['time_label']}.",
+                )
+
+    for change in result.get("changed_positions", []):
+        old_entry = change["old"]
+        new_entry = change["new"]
+        court_name = change_court_name(new_entry, canonical_court_names)
+        old_label = old_entry.get("match_level_label") or old_entry.get("division_label") or old_entry.get("match_code", "")
+        new_label = new_entry.get("match_level_label") or new_entry.get("division_label") or new_entry.get("match_code", "")
+        change_word = "level changed" if change.get("change_type") == "level" else "division changed"
+
+        add_court_change(
+            grouped,
+            court_name,
+            new_entry.get("time_key", ""),
+            (
+                f"{new_entry['time_label']}: {old_entry['match_code']} → {new_entry['match_code']} "
+                f"({change_word} from {old_label} to {new_label})."
+            ),
+        )
+
+    return dict(sorted(grouped.items(), key=lambda item: natural_sort_key(item[0])))
+
+
+def render_changes_by_court(changes_by_court: dict):
+    for court_name, changes in changes_by_court.items():
+        st.markdown(f"**{court_name}**")
+
+        for change in sorted(changes, key=lambda item: (item.get("time_key", ""), item.get("line", ""))):
+            st.write(f"- {change['line']}")
+
+
 def render_comparison_results(result: dict, uploaded_summary: dict, selected_date: date):
     st.caption(
         f"Compared {uploaded_summary['match_count']} uploaded matches from '{uploaded_summary['sheet_name']}' "
         f"to {result['online_match_count']} online matches for {format_long_date(selected_date)}. "
-        "Match-code comparisons use age only."
+        "Match-code comparisons use the leading age + division-level code."
     )
 
     if result["alias_notes"]:
@@ -2004,78 +2239,18 @@ def render_comparison_results(result: dict, uploaded_summary: dict, selected_dat
                 st.write(f"- ...and {len(result['alias_notes']) - 20} more.")
 
     if result["is_unchanged"]:
-        st.success("✅ Grid Structure Verified & Unchanged")
+        st.success("✅ Grid Verified & Unchanged")
         return
 
-    st.warning("Grid structure changes found.")
+    st.warning("Schedule changes found.")
 
-    # A moved match is a structure change in two places:
-    # - the old court/time lost that match slot
-    # - the new court/time added that match slot
-    # To keep the output language consistent, moved matches are folded into
-    # the same court-based lost/added summary instead of being rendered as
-    # separate "Age X moved from..." lines.
-    moved_old_entries = [
-        entry
-        for move in result.get("moved_matches", [])
-        for entry in move.get("old_entries", [])
-    ]
-    moved_new_entries = [
-        entry
-        for move in result.get("moved_matches", [])
-        for entry in move.get("new_entries", [])
-    ]
+    changes_by_court = build_changes_by_court(result)
 
-    structure_removed_by_court = group_change_entries_by_court(
-        result.get("removed_entries", []) + moved_old_entries,
-        result["canonical_court_names"],
-    )
-    structure_added_by_court = group_change_entries_by_court(
-        result.get("added_entries", []) + moved_new_entries,
-        result["canonical_court_names"],
-    )
+    if changes_by_court:
+        st.markdown("**Changes by court**")
+        render_changes_by_court(changes_by_court)
 
-    if structure_removed_by_court:
-        st.markdown("**Lost matches**")
-        render_grouped_change_lines(structure_removed_by_court, "lost", "#C00000")
 
-    if structure_added_by_court:
-        st.markdown("**Added matches**")
-        render_grouped_change_lines(structure_added_by_court, "added", "#0070C0")
-
-    if result.get("moved_matches"):
-        with st.expander("Move details"):
-            st.write(
-                "Moves are included above as lost slots on the original court/time "
-                "and added slots on the new court/time."
-            )
-            for move in result["moved_matches"]:
-                old_locations = ", ".join(
-                    entry_location_text(entry, result["canonical_court_names"])
-                    for entry in sorted_entries_by_time(move["old_entries"])
-                )
-                new_locations = ", ".join(
-                    entry_location_text(entry, result["canonical_court_names"])
-                    for entry in sorted_entries_by_time(move["new_entries"])
-                )
-                st.write(
-                    f"- Age {move['match_age']} moved from {old_locations} to {new_locations}."
-                )
-
-    if result["changed_positions"]:
-        st.markdown("**Changed age at same court and time**")
-        for change in result["changed_positions"]:
-            old_entry = change["old"]
-            new_entry = change["new"]
-            court_name = result["canonical_court_names"].get(
-                new_entry.get("aligned_court_key"),
-                new_entry["court_name"],
-            )
-            st.write(
-                f"- **{court_name} at {new_entry['time_label']}** is now "
-                f"**Age {new_entry.get('match_age', '')}**; "
-                f"was **Age {old_entry.get('match_age', '')}**."
-            )
 
 
 # =========================
@@ -2802,6 +2977,7 @@ if event_info:
                     comparison_result = compare_schedule_structures(
                         uploaded_summary["entries"],
                         online_entries,
+                        division_settings,
                     )
 
                     st.session_state.comparison_result = comparison_result
