@@ -2395,7 +2395,7 @@ def render_change_summary_table(changes_by_court: dict):
         }
         table.comparison-summary-table th:nth-child(2),
         table.comparison-summary-table td:nth-child(2) {
-            text-align: right;
+            text-align: center;
             width: 4.5rem;
         }
         table.comparison-summary-table td:nth-child(3) {
