@@ -16,7 +16,7 @@ from openpyxl.utils import get_column_letter
 
 # =========================
 # APP SETTINGS
-# UPDATED: Assignment Grid row-selection popup + Start Over callback fix
+# UPDATED: Multi-event support for combined grids and comparisons
 # =========================
 
 BASE_URL = "https://results.advancedeventsystems.com/api/event"
@@ -149,11 +149,20 @@ PRESET_EVENT_BUTTON_ROWS = [
         {"label": "AAU Wave 6", "url": "", "active": False},
     ],
     [
+        {
+            "label": "AAU Waves 3 + 4",
+            "urls": [
+                "https://results.advancedeventsystems.com/event/PTAwMDAwNDUwMjg90/court-schedule",
+                "https://results.advancedeventsystems.com/event/PTAwMDAwNDUwMjk90/court-schedule",
+            ],
+            "active": True,
+        },
         {"label": "USAV GJNC 11-13", "url": "https://results.advancedeventsystems.com//event/PTAwMDAwNDE5NTg90?_gl=1*1v32ep9*_ga*MjA1MjMzMTg2Ny4xNzY2NzgwNjUz*_ga_PQ25JN9PJ8*czE3ODE2NTM3NjkkbzkyJGcxJHQxNzgxNjUzOTQxJGo2MCRsMCRoMA..&_ga=2.65442030.1738899225.1781380090-2052331867.1766780653", "active": False},
         {"label": "USAV GJNC 14-17", "url": "https://results.advancedeventsystems.com/event/PTAwMDAwNDIwNjI90/court-schedule", "active": True},
         {"label": "USAV BJNC", "url": "", "active": False},
     ],
 ]
+
 
 
 # =========================
@@ -186,6 +195,242 @@ def extract_event_key(user_input: str) -> str:
     return text
 
 
+def extract_event_keys(user_input: str) -> list[str]:
+    """Return unique AES event keys from pasted keys, URLs, commas, semicolons, or new lines."""
+    raw_text = (user_input or "").strip()
+
+    if not raw_text:
+        return []
+
+    pieces = [piece.strip() for piece in re.split(r"[\n,;]+", raw_text) if piece.strip()]
+    keys = []
+
+    for piece in pieces:
+        key = extract_event_key(piece)
+        if key:
+            keys.append(key)
+
+    return list(dict.fromkeys(keys))
+
+
+def event_key_input_text(values) -> str:
+    """Convert a preset url/url-list/key/key-list value into textarea-friendly input."""
+    if values is None:
+        return ""
+
+    if isinstance(values, str):
+        return values.strip()
+
+    return "\n".join(str(value).strip() for value in values if str(value).strip())
+
+
+def composite_division_id(event_key: str, division_id) -> str:
+    """Avoid division-id collisions when multiple AES events are combined."""
+    return f"{event_key}:{division_id}"
+
+
+def event_records_have_multiple_events(event_records: list[dict]) -> bool:
+    return len(event_records or []) > 1
+
+
+def event_record_key_signature(event_records: list[dict]) -> tuple[str, ...]:
+    return tuple(record.get("event_key", "") for record in event_records or [])
+
+
+def event_record_date_range(record: dict) -> tuple[date, date]:
+    info = record.get("event_info", {}) or {}
+    return parse_event_date(info["StartDate"]), parse_event_date(info["EndDate"])
+
+
+def event_record_includes_date(record: dict, event_date: date) -> bool:
+    start_date, end_date = event_record_date_range(record)
+    return start_date <= event_date <= end_date
+
+
+def annotate_division_for_event(division: dict, event_key: str) -> dict:
+    annotated = dict(division or {})
+    annotated["OriginalDivisionId"] = annotated.get("DivisionId")
+    annotated["DivisionId"] = composite_division_id(event_key, annotated.get("DivisionId"))
+    annotated["SourceEventKey"] = event_key
+    return annotated
+
+
+def annotate_match_for_event(match: dict, event_key: str) -> dict:
+    annotated_match = dict(match or {})
+    annotated_match["SourceEventKey"] = event_key
+
+    division = dict((match or {}).get("Division", {}) or {})
+    if division:
+        division["OriginalDivisionId"] = division.get("DivisionId")
+        division["DivisionId"] = composite_division_id(event_key, division.get("DivisionId"))
+        division["SourceEventKey"] = event_key
+        annotated_match["Division"] = division
+
+    return annotated_match
+
+
+def annotate_match_data_for_event(match_data: dict, event_key: str, event_info: dict | None = None) -> dict:
+    """Make a match-data object safe to merge with other events."""
+    event_label = (event_info or {}).get("Name", event_key)
+    annotated_courts = []
+
+    for court in (match_data or {}).get("CourtSchedules", []) or []:
+        annotated_court = dict(court or {})
+        annotated_court["SourceEventKey"] = event_key
+        annotated_court["SourceEventName"] = event_label
+        annotated_court["CourtMatches"] = [
+            annotate_match_for_event(match, event_key)
+            for match in (court or {}).get("CourtMatches", []) or []
+        ]
+        annotated_courts.append(annotated_court)
+
+    annotated = dict(match_data or {})
+    annotated["CourtSchedules"] = annotated_courts
+    return annotated
+
+
+def merge_match_data_objects(match_data_objects: list[dict]) -> dict:
+    """Merge several AES match-data responses into one CourtSchedules structure.
+
+    Courts with the same displayed name are combined. If two event schedules would
+    place a match on the same court at the same start time, the later event gets
+    its own event-labeled court column so one match does not overwrite another.
+    """
+    merged_courts = {}
+    court_order = []
+
+    def start_time_keys(court: dict) -> set:
+        return {
+            match.get("ScheduledStartDateTime")
+            for match in court.get("CourtMatches", []) or []
+            if match.get("ScheduledStartDateTime") is not None
+        }
+
+    for match_data in match_data_objects:
+        for court in (match_data or {}).get("CourtSchedules", []) or []:
+            court_name = str(court.get("Name", "")).strip()
+            base_key = normalize_court_exact_key(court_name)
+            court_key = base_key
+
+            if court_key in merged_courts:
+                existing_starts = start_time_keys(merged_courts[court_key])
+                incoming_starts = start_time_keys(court)
+
+                if existing_starts & incoming_starts:
+                    source_label = compact_event_name(court.get("SourceEventName", "Event"))
+                    court_key = normalize_court_exact_key(f"{source_label}_{court_name}")
+                    court = dict(court)
+                    court["Name"] = f"{court.get('SourceEventName', 'Event')} - {court_name}"
+
+            if court_key not in merged_courts:
+                merged_court = dict(court)
+                merged_court["CourtMatches"] = []
+                merged_courts[court_key] = merged_court
+                court_order.append(court_key)
+
+            merged_courts[court_key]["CourtMatches"].extend(
+                list(court.get("CourtMatches", []) or [])
+            )
+
+    for court in merged_courts.values():
+        court["CourtMatches"] = sorted(
+            court.get("CourtMatches", []) or [],
+            key=lambda match: (
+                match.get("ScheduledStartDateTime", 0),
+                match.get("ScheduledEndDateTime", 0),
+                clean_match_name(match.get("CompleteShortName", "")),
+            ),
+        )
+
+    ordered_courts = [merged_courts[key] for key in court_order]
+
+    return {"CourtSchedules": ordered_courts}
+
+
+def build_event_records(event_keys: list[str]) -> list[dict]:
+    records = []
+
+    for event_key in event_keys:
+        info = get_event_info(event_key)
+        records.append({"event_key": event_key, "event_info": info})
+
+    return records
+
+
+def build_combined_event_info(event_records: list[dict]) -> dict:
+    """Return a single event_info-like dict for one event or an event set."""
+    if not event_records:
+        return {}
+
+    if len(event_records) == 1:
+        record = event_records[0]
+        info = dict(record["event_info"] or {})
+        event_key = record["event_key"]
+        info["Divisions"] = [
+            annotate_division_for_event(division, event_key)
+            for division in info.get("Divisions", []) or []
+        ]
+        info["EventKeys"] = [event_key]
+        info["Events"] = [{"event_key": event_key, "event_info": record["event_info"]}]
+        return info
+
+    starts = []
+    ends = []
+    names = []
+    locations = []
+    divisions = []
+
+    for record in event_records:
+        event_key = record["event_key"]
+        info = record["event_info"] or {}
+        starts.append(parse_event_date(info["StartDate"]))
+        ends.append(parse_event_date(info["EndDate"]))
+        names.append(info.get("Name") or event_key)
+
+        location = (info.get("Location") or "").strip()
+        if location and location not in locations:
+            locations.append(location)
+
+        divisions.extend(
+            annotate_division_for_event(division, event_key)
+            for division in info.get("Divisions", []) or []
+        )
+
+    return {
+        "Name": f"Combined_{len(event_records)}_Events",
+        "DisplayName": "Combined Events",
+        "CombinedEventNames": names,
+        "Location": "; ".join(locations),
+        "StartDate": min(starts).isoformat(),
+        "EndDate": max(ends).isoformat(),
+        "Divisions": divisions,
+        "EventKeys": [record["event_key"] for record in event_records],
+        "Events": event_records,
+    }
+
+
+def get_combined_match_info(event_records: list[dict], event_date: date) -> dict:
+    """Fetch and merge match data for every event in the set that contains event_date."""
+    match_data_objects = []
+
+    for record in event_records or []:
+        if not event_record_includes_date(record, event_date):
+            continue
+
+        event_key = record["event_key"]
+        event_info = record.get("event_info", {}) or {}
+        match_data = get_match_info(event_key, event_date)
+        match_data_objects.append(
+            annotate_match_data_for_event(
+                match_data=match_data,
+                event_key=event_key,
+                event_info=event_info,
+            )
+        )
+
+    return merge_match_data_objects(match_data_objects)
+
+
 def clear_assignment_download_state():
     keys_to_clear = [
         "assignment_download_custom",
@@ -203,6 +448,8 @@ def reset_app():
     keys_to_clear = [
         "event_info",
         "event_key",
+        "event_keys",
+        "event_records",
         "event_input_value",
         "generated_workbooks",
         "level_rows",
@@ -790,7 +1037,7 @@ def count_matches_in_match_data(match_data: dict) -> int:
     )
 
 
-def build_event_match_count_summary(event_key: str, event_info: dict) -> dict:
+def build_event_match_count_summary(event_records: list[dict], event_info: dict) -> dict:
     start_date = parse_event_date(event_info["StartDate"])
     end_date = parse_event_date(event_info["EndDate"])
 
@@ -798,7 +1045,7 @@ def build_event_match_count_summary(event_key: str, event_info: dict) -> dict:
     total = 0
 
     for event_date in date_range(start_date, end_date):
-        match_data = get_match_info(event_key, event_date)
+        match_data = get_combined_match_info(event_records, event_date)
         count = count_matches_in_match_data(match_data)
         total += count
         by_day.append({"date": event_date, "count": count})
@@ -1837,7 +2084,7 @@ def save_workbook_to_bytes(wb: Workbook) -> bytes:
 
 
 def create_assignment_grid_file(
-    event_key: str,
+    event_records: list[dict],
     event_info: dict,
     division_settings: dict,
     assignment_role_ids: list[str] | None = None,
@@ -1858,7 +2105,7 @@ def create_assignment_grid_file(
 
     for event_date in date_range(start_date, end_date):
         sheet_name = sheet_name_for_date(event_date)
-        match_data = get_match_info(event_key, event_date)
+        match_data = get_combined_match_info(event_records, event_date)
 
         assignment_ws = assignment_wb.create_sheet(title=sheet_name)
         build_assignment_grid_sheet(
@@ -1881,7 +2128,7 @@ def create_assignment_grid_file(
 
 
 def create_workbooks(
-    event_key: str,
+    event_records: list[dict],
     event_info: dict,
     division_settings: dict,
     assignment_role_ids: list[str] | None = None,
@@ -1906,7 +2153,7 @@ def create_workbooks(
 
     for event_date in date_range(start_date, end_date):
         sheet_name = sheet_name_for_date(event_date)
-        match_data = get_match_info(event_key, event_date)
+        match_data = get_combined_match_info(event_records, event_date)
 
         assignment_ws = assignment_wb.create_sheet(title=sheet_name)
         build_assignment_grid_sheet(
@@ -2045,7 +2292,7 @@ with top_right:
     st.button("Start Over", on_click=reset_app, use_container_width=True)
 
 st.write(
-    "Paste an AES event key or full AES schedule URL, review the event information, "
+    "Paste one or more AES event keys or full AES schedule URLs, review the combined event information, "
     "set division level abbreviations, then generate both Excel workbooks."
 )
 
@@ -2054,6 +2301,12 @@ if "event_info" not in st.session_state:
 
 if "event_key" not in st.session_state:
     st.session_state.event_key = ""
+
+if "event_keys" not in st.session_state:
+    st.session_state.event_keys = []
+
+if "event_records" not in st.session_state:
+    st.session_state.event_records = []
 
 if "event_input_value" not in st.session_state:
     st.session_state.event_input_value = ""
@@ -2083,6 +2336,9 @@ if "comparison_changed_workbooks" not in st.session_state:
 def clear_loaded_event_state():
     clear_assignment_download_state()
     st.session_state.event_info = None
+    st.session_state.event_key = ""
+    st.session_state.event_keys = []
+    st.session_state.event_records = []
     st.session_state.generated_workbooks = None
     st.session_state.level_rows = None
     st.session_state.event_match_counts = None
@@ -2092,18 +2348,23 @@ def clear_loaded_event_state():
     st.session_state.comparison_changed_workbooks = None
 
 
-def load_event_from_input(raw_input: str, source_label: str = "event"):
-    clean_key = extract_event_key(raw_input)
+def load_events_from_input(raw_input: str, source_label: str = "event set"):
+    clean_keys = extract_event_keys(raw_input)
 
-    if not clean_key:
-        st.error("Enter an event key or URL.")
+    if not clean_keys:
+        st.error("Enter at least one event key or URL.")
         return
 
     try:
         clear_assignment_download_state()
         with st.spinner(f"Loading {source_label}..."):
-            st.session_state.event_info = get_event_info(clean_key)
-            st.session_state.event_key = clean_key
+            event_records = build_event_records(clean_keys)
+            combined_event_info = build_combined_event_info(event_records)
+
+            st.session_state.event_records = event_records
+            st.session_state.event_keys = clean_keys
+            st.session_state.event_key = clean_keys[0] if len(clean_keys) == 1 else "|".join(clean_keys)
+            st.session_state.event_info = combined_event_info
             st.session_state.event_input_value = raw_input
             st.session_state.generated_workbooks = None
             st.session_state.comparison_result = None
@@ -2111,17 +2372,25 @@ def load_event_from_input(raw_input: str, source_label: str = "event"):
             st.session_state.comparison_selected_date = None
             st.session_state.comparison_changed_workbooks = None
             st.session_state.level_rows = build_level_rows(
-                st.session_state.event_info.get("Divisions", [])
+                combined_event_info.get("Divisions", [])
             )
             st.session_state.event_match_counts = build_event_match_count_summary(
-                clean_key,
-                st.session_state.event_info,
+                event_records,
+                combined_event_info,
             )
 
-        st.success(f"Loaded {source_label}.")
-    except Exception:
+        if len(clean_keys) == 1:
+            st.success(f"Loaded {source_label}.")
+        else:
+            st.success(f"Loaded {len(clean_keys)} events into one combined grid.")
+    except Exception as exc:
         clear_loaded_event_state()
-        st.error(f"Could not load {source_label}.")
+        st.error(f"Could not load {source_label}: {exc}")
+
+
+def load_event_from_input(raw_input: str, source_label: str = "event"):
+    """Backward-compatible wrapper for older calls."""
+    load_events_from_input(raw_input, source_label)
 
 
 def selected_assignment_role_ids_from_checkboxes(prefix: str = "assignment_row_include") -> list[str]:
@@ -2150,7 +2419,7 @@ def selected_assignment_role_ids_from_checkboxes(prefix: str = "assignment_row_i
 
 
 def assignment_download_signature(
-    event_key: str,
+    event_records: list[dict],
     division_settings: dict,
     selected_role_ids: list[str],
 ) -> tuple:
@@ -2165,17 +2434,17 @@ def assignment_download_signature(
         )
     )
 
-    return event_key, tuple(selected_role_ids), division_signature
+    return event_record_key_signature(event_records), tuple(selected_role_ids), division_signature
 
 
 def render_assignment_download_options(
-    event_key: str,
+    event_records: list[dict],
     event_info: dict,
     division_settings: dict,
 ):
     selected_role_ids = selected_assignment_role_ids_from_checkboxes()
     signature = assignment_download_signature(
-        event_key,
+        event_records,
         division_settings,
         selected_role_ids,
     )
@@ -2204,7 +2473,7 @@ def render_assignment_download_options(
         try:
             with st.spinner("Preparing Assignment Grid download..."):
                 custom_file = create_assignment_grid_file(
-                    event_key=event_key,
+                    event_records=event_records,
                     event_info=event_info,
                     division_settings=division_settings,
                     assignment_role_ids=selected_role_ids,
@@ -2239,8 +2508,16 @@ def render_assignment_download_options(
         st.session_state.show_assignment_download_options = False
 
 
+def preset_event_urls(preset_event: dict) -> list[str]:
+    if "urls" in preset_event:
+        return [str(url).strip() for url in preset_event.get("urls", []) if str(url).strip()]
+
+    url = str(preset_event.get("url", "")).strip()
+    return [url] if url else []
+
+
 def preset_event_is_active(preset_event: dict) -> bool:
-    return bool(str(preset_event.get("url", "")).strip()) and bool(preset_event.get("active", True))
+    return bool(preset_event_urls(preset_event)) and bool(preset_event.get("active", True))
 
 
 def render_preset_event_buttons():
@@ -2251,9 +2528,9 @@ def render_preset_event_buttons():
 
         for column, preset_event in zip(columns, preset_row):
             label = preset_event.get("label", "Event")
-            url = str(preset_event.get("url", "")).strip()
+            preset_input = event_key_input_text(preset_event_urls(preset_event))
             is_active = preset_event_is_active(preset_event)
-            help_text = "Load this preset event." if is_active else "No active link is configured for this button."
+            help_text = "Load this preset event set." if is_active else "No active link is configured for this button."
 
             with column:
                 clicked = st.button(
@@ -2265,29 +2542,36 @@ def render_preset_event_buttons():
                 )
 
             if clicked:
-                st.session_state.event_input_value = url
-                load_event_from_input(url, label)
+                st.session_state.event_input_value = preset_input
+                load_events_from_input(preset_input, label)
 
 
 render_preset_event_buttons()
 st.divider()
 
-event_input = st.text_input(
-    "AES Event Key or Schedule URL",
-    placeholder="Example: PTAwMDAwNDEzMjQ90 or https://results.advancedeventsystems.com/event/PTAwMDAwNDEzMjQ90/home",
+event_input = st.text_area(
+    "AES Event Key(s) or Schedule URL(s)",
+    placeholder=(
+        "Paste one event per line, or separate multiple events with commas.\n"
+        "Example: PTAwMDAwNDEzMjQ90\n"
+        "https://results.advancedeventsystems.com/event/PTAwMDAwNDEzMjQ90/home"
+    ),
     key="event_input_value",
+    height=120,
 )
 
-fetch_clicked = st.button("Fetch Event", type="primary")
+fetch_clicked = st.button("Fetch Event(s)", type="primary")
 
 if fetch_clicked:
-    load_event_from_input(event_input, "event")
+    load_events_from_input(event_input, "event set")
 
 
 event_info = st.session_state.event_info
 
 if event_info:
-    event_name = event_info.get("Name", "")
+    event_records = st.session_state.event_records
+    event_keys = st.session_state.event_keys
+    event_name = event_info.get("DisplayName") or event_info.get("Name", "")
     location = event_info.get("Location", "")
     start_date = parse_event_date(event_info["StartDate"])
     end_date = parse_event_date(event_info["EndDate"])
@@ -2301,13 +2585,20 @@ if event_info:
     c2.metric("End Date", format_long_date(end_date))
     c3.metric("Location", location or "Not listed")
 
-    st.caption(f"AES event key: `{st.session_state.event_key}`")
+    if len(event_keys) <= 1:
+        st.caption(f"AES event key: `{event_keys[0] if event_keys else st.session_state.event_key}`")
+    else:
+        st.caption(f"AES event keys: `{', '.join(event_keys)}`")
+        with st.expander("Events included in this combined grid"):
+            for record in event_records:
+                record_info = record.get("event_info", {}) or {}
+                st.write(f"- **{record_info.get('Name', record.get('event_key'))}** — `{record.get('event_key')}`")
 
     if st.session_state.event_match_counts is None:
         try:
             with st.spinner("Counting matches by day..."):
                 st.session_state.event_match_counts = build_event_match_count_summary(
-                    st.session_state.event_key,
+                    event_records,
                     event_info,
                 )
         except Exception as exc:
@@ -2371,15 +2662,15 @@ if event_info:
             clear_assignment_download_state()
             with st.spinner("Generating..."):
                 st.session_state.generated_workbooks = create_workbooks(
-                    event_key=st.session_state.event_key,
+                    event_records=event_records,
                     event_info=event_info,
                     division_settings=division_settings,
                 )
 
             st.success("Done.")
-        except Exception:
+        except Exception as exc:
             st.session_state.generated_workbooks = None
-            st.error("Could not generate workbooks.")
+            st.error(f"Could not generate workbooks: {exc}")
 
     generated = st.session_state.generated_workbooks
 
@@ -2418,7 +2709,7 @@ if event_info:
                 @dialog_decorator("Assignment Grid Download Options")
                 def assignment_download_dialog():
                     render_assignment_download_options(
-                        event_key=st.session_state.event_key,
+                        event_records=event_records,
                         event_info=event_info,
                         division_settings=division_settings,
                     )
@@ -2427,7 +2718,7 @@ if event_info:
             else:
                 with st.expander("Assignment Grid Download Options", expanded=True):
                     render_assignment_download_options(
-                        event_key=st.session_state.event_key,
+                        event_records=event_records,
                         event_info=event_info,
                         division_settings=division_settings,
                     )
@@ -2437,7 +2728,7 @@ if event_info:
     st.subheader("Compare Uploaded Workbook to Online Schedule")
     st.write(
         "Upload a previously generated or manually edited grid workbook, choose the day/sheet, "
-        "and compare its court/time match structure to the current AES online schedule."
+        "and compare its court/time match structure to the current combined AES online schedule."
     )
 
     available_compare_dates = list(date_range(start_date, end_date))
@@ -2492,8 +2783,8 @@ if event_info:
                         uploaded_compare_workbook,
                         selected_compare_sheet,
                     )
-                    current_match_data = get_match_info(
-                        st.session_state.event_key,
+                    current_match_data = get_combined_match_info(
+                        event_records,
                         selected_compare_date,
                     )
                     online_entries = build_online_schedule_entries(
@@ -2572,4 +2863,4 @@ if event_info:
             )
 
 else:
-    st.info("Enter an AES event key or full AES schedule URL to begin.")
+    st.info("Enter one or more AES event keys or full AES schedule URLs to begin.")
