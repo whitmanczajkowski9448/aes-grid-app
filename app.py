@@ -1,3 +1,4 @@
+import html
 import re
 from collections import defaultdict
 from copy import copy
@@ -1076,7 +1077,39 @@ def render_event_match_counts(match_counts: dict):
 
     if day_rows:
         st.markdown("**Match Count by Day**")
-        st.table(day_rows)
+        table_rows = "".join(
+            "<tr>"
+            f"<td>{html.escape(str(row['Day']))}</td>"
+            f"<td>{html.escape(str(row['Matches']))}</td>"
+            "</tr>"
+            for row in day_rows
+        )
+        st.markdown(
+            """
+            <style>
+            table.match-count-table {
+                border-collapse: collapse;
+                width: auto;
+                min-width: 280px;
+                margin-top: 0.25rem;
+            }
+            table.match-count-table th,
+            table.match-count-table td {
+                border: 1px solid rgba(49, 51, 63, 0.2);
+                padding: 0.35rem 0.55rem;
+            }
+            table.match-count-table th:nth-child(2),
+            table.match-count-table td:nth-child(2) {
+                text-align: right;
+            }
+            </style>
+            """
+            f"<table class='match-count-table'>"
+            "<thead><tr><th>Day</th><th>Matches</th></tr></thead>"
+            f"<tbody>{table_rows}</tbody>"
+            "</table>",
+            unsafe_allow_html=True,
+        )
 
 
 def get_grid_start_end(sheet_date: date, matches: list, tz_name: str):
@@ -2135,11 +2168,13 @@ def change_court_name(entry: dict, canonical_court_names: dict) -> str:
     return canonical_court_names.get(aligned_key, entry.get("court_name", ""))
 
 
-def add_court_change(grouped: dict, court_name: str, time_key: str, line: str):
-    grouped[court_name].append({
+def add_court_change(grouped: dict, court_name: str, time_key: str, line: str, **details):
+    change = {
         "time_key": time_key,
         "line": line,
-    })
+    }
+    change.update(details)
+    grouped[court_name].append(change)
 
 
 def build_changes_by_court(result: dict) -> dict:
@@ -2153,6 +2188,13 @@ def build_changes_by_court(result: dict) -> dict:
             court_name,
             entry.get("time_key", ""),
             f"{entry['time_label']}: {entry['match_code']} was removed from this court/time.",
+            action="removed",
+            time_label=entry.get("time_label", ""),
+            old_code=entry.get("match_code", ""),
+            new_code="",
+            old_label=entry.get("match_level_label") or entry.get("division_label", ""),
+            new_label="",
+            note="Removed from this court/time",
         )
 
     for entry in result.get("added_entries", []):
@@ -2162,6 +2204,13 @@ def build_changes_by_court(result: dict) -> dict:
             court_name,
             entry.get("time_key", ""),
             f"{entry['time_label']}: {entry['match_code']} is new at this court/time.",
+            action="added",
+            time_label=entry.get("time_label", ""),
+            old_code="",
+            new_code=entry.get("match_code", ""),
+            old_label="",
+            new_label=entry.get("match_level_label") or entry.get("division_label", ""),
+            note="New at this court/time",
         )
 
     for move in result.get("moved_matches", []):
@@ -2179,6 +2228,13 @@ def build_changes_by_court(result: dict) -> dict:
                     old_court,
                     old_entry.get("time_key", ""),
                     f"{old_entry['time_label']} → {new_entry['time_label']}: {move_label} moved within this court.",
+                    action="moved",
+                    time_label=old_entry.get("time_label", ""),
+                    old_code=old_entry.get("match_code", ""),
+                    new_code=new_entry.get("match_code", ""),
+                    old_label=move_label,
+                    new_label=move_label,
+                    note=f"Moved to {new_entry.get('time_label', '')} on this court",
                 )
             else:
                 add_court_change(
@@ -2186,12 +2242,26 @@ def build_changes_by_court(result: dict) -> dict:
                     old_court,
                     old_entry.get("time_key", ""),
                     f"{old_entry['time_label']}: {move_label} moved to {new_court} at {new_entry['time_label']}.",
+                    action="moved_out",
+                    time_label=old_entry.get("time_label", ""),
+                    old_code=old_entry.get("match_code", ""),
+                    new_code="",
+                    old_label=move_label,
+                    new_label="",
+                    note=f"Moved to {new_court} at {new_entry.get('time_label', '')}",
                 )
                 add_court_change(
                     grouped,
                     new_court,
                     new_entry.get("time_key", ""),
                     f"{new_entry['time_label']}: {move_label} moved from {old_court} at {old_entry['time_label']}.",
+                    action="moved_in",
+                    time_label=new_entry.get("time_label", ""),
+                    old_code="",
+                    new_code=new_entry.get("match_code", ""),
+                    old_label="",
+                    new_label=move_label,
+                    note=f"Moved from {old_court} at {old_entry.get('time_label', '')}",
                 )
 
     for change in result.get("changed_positions", []):
@@ -2200,7 +2270,8 @@ def build_changes_by_court(result: dict) -> dict:
         court_name = change_court_name(new_entry, canonical_court_names)
         old_label = old_entry.get("match_level_label") or old_entry.get("division_label") or old_entry.get("match_code", "")
         new_label = new_entry.get("match_level_label") or new_entry.get("division_label") or new_entry.get("match_code", "")
-        change_word = "level changed" if change.get("change_type") == "level" else "division changed"
+        action = "level_change" if change.get("change_type") == "level" else "division_change"
+        change_word = "level changed" if action == "level_change" else "division changed"
 
         add_court_change(
             grouped,
@@ -2210,17 +2281,159 @@ def build_changes_by_court(result: dict) -> dict:
                 f"{new_entry['time_label']}: {old_entry['match_code']} → {new_entry['match_code']} "
                 f"({change_word} from {old_label} to {new_label})."
             ),
+            action=action,
+            time_label=new_entry.get("time_label", ""),
+            old_code=old_entry.get("match_code", ""),
+            new_code=new_entry.get("match_code", ""),
+            old_label=old_label,
+            new_label=new_label,
+            note=change_word.capitalize(),
         )
 
     return dict(sorted(grouped.items(), key=lambda item: natural_sort_key(item[0])))
 
 
-def render_changes_by_court(changes_by_court: dict):
-    for court_name, changes in changes_by_court.items():
-        st.markdown(f"**{court_name}**")
+def sorted_change_items(changes: list[dict]) -> list[dict]:
+    return sorted(changes, key=lambda item: (item.get("time_key", ""), item.get("line", "")))
 
-        for change in sorted(changes, key=lambda item: (item.get("time_key", ""), item.get("line", ""))):
-            st.write(f"- {change['line']}")
+
+def compact_time_span(changes: list[dict]) -> str:
+    ordered = sorted_change_items(changes)
+    time_labels = []
+    seen = set()
+
+    for change in ordered:
+        label = change.get("time_label") or change.get("line", "").split(":", 1)[0]
+        key = change.get("time_key") or label
+        if label and key not in seen:
+            seen.add(key)
+            time_labels.append(label)
+
+    if not time_labels:
+        return ""
+
+    if len(time_labels) == 1:
+        return time_labels[0]
+
+    if len(time_labels) <= 3:
+        return ", ".join(time_labels)
+
+    return f"{time_labels[0]}–{time_labels[-1]}"
+
+
+def compact_change_summary(changes: list[dict]) -> str:
+    action_labels = {
+        "added": "new matches",
+        "removed": "removed matches",
+        "moved": "moved within court",
+        "moved_in": "moved in",
+        "moved_out": "moved out",
+    }
+    grouped = defaultdict(int)
+
+    for change in changes:
+        action = change.get("action", "change")
+        if action in {"level_change", "division_change"}:
+            old_label = change.get("old_label") or "old division"
+            new_label = change.get("new_label") or "new division"
+            label = f"{old_label} → {new_label}"
+        else:
+            label = action_labels.get(action, "other changes")
+        grouped[label] += 1
+
+    if not grouped:
+        return "Changes detected"
+
+    ordered = sorted(grouped.items(), key=lambda item: (-item[1], item[0]))
+    labels = [label for label, _ in ordered]
+
+    if len(labels) <= 2:
+        return "; ".join(labels)
+
+    return "; ".join(labels[:2]) + f"; +{len(labels) - 2} more"
+
+
+def render_change_summary_table(changes_by_court: dict):
+    rows = []
+
+    for court_name, changes in changes_by_court.items():
+        rows.append({
+            "Court": court_name,
+            "Changes": len(changes),
+            "Times": compact_time_span(changes),
+            "Summary": compact_change_summary(changes),
+        })
+
+    body = "".join(
+        "<tr>"
+        f"<td>{html.escape(str(row['Court']))}</td>"
+        f"<td>{html.escape(str(row['Changes']))}</td>"
+        f"<td>{html.escape(str(row['Times']))}</td>"
+        f"<td>{html.escape(str(row['Summary']))}</td>"
+        "</tr>"
+        for row in rows
+    )
+
+    st.markdown(
+        """
+        <style>
+        table.comparison-summary-table {
+            border-collapse: collapse;
+            width: 100%;
+            margin-top: 0.25rem;
+            margin-bottom: 0.75rem;
+        }
+        table.comparison-summary-table th,
+        table.comparison-summary-table td {
+            border-bottom: 1px solid rgba(49, 51, 63, 0.15);
+            padding: 0.35rem 0.45rem;
+            vertical-align: top;
+        }
+        table.comparison-summary-table th {
+            text-align: left;
+            font-weight: 700;
+        }
+        table.comparison-summary-table th:nth-child(2),
+        table.comparison-summary-table td:nth-child(2) {
+            text-align: right;
+            width: 4.5rem;
+        }
+        table.comparison-summary-table td:nth-child(3) {
+            white-space: nowrap;
+            width: 10rem;
+        }
+        </style>
+        """
+        f"<table class='comparison-summary-table'>"
+        "<thead><tr><th>Court</th><th>Changes</th><th>Times</th><th>Summary</th></tr></thead>"
+        f"<tbody>{body}</tbody>"
+        "</table>",
+        unsafe_allow_html=True,
+    )
+
+
+def render_change_detail_table(changes_by_court: dict):
+    detail_rows = []
+
+    for court_name, changes in changes_by_court.items():
+        for change in sorted_change_items(changes):
+            detail_rows.append({
+                "Court": court_name,
+                "Time": change.get("time_label", ""),
+                "Old": change.get("old_code", ""),
+                "New": change.get("new_code", ""),
+                "Change": change.get("note") or change.get("line", ""),
+            })
+
+    if detail_rows:
+        st.dataframe(detail_rows, hide_index=True, use_container_width=True)
+
+
+def render_changes_by_court(changes_by_court: dict):
+    render_change_summary_table(changes_by_court)
+
+    with st.expander("Show match-by-match details"):
+        render_change_detail_table(changes_by_court)
 
 
 def render_comparison_results(result: dict, uploaded_summary: dict, selected_date: date):
